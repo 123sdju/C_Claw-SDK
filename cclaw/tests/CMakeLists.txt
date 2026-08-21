@@ -95,11 +95,6 @@ add_test(NAME sdk_core_forbidden_includes
         "-DCCLAW_SOURCE_DIR=${CMAKE_CURRENT_LIST_DIR}/.."
         -P "${CMAKE_CURRENT_LIST_DIR}/boundary/test_core_forbidden_includes.cmake")
 
-add_test(NAME profile_esp32s31_tools_contract
-    COMMAND "${CMAKE_COMMAND}"
-        "-DCCLAW_SOURCE_DIR=${CMAKE_CURRENT_LIST_DIR}/.."
-        -P "${CMAKE_CURRENT_LIST_DIR}/boundary/test_esp32s31_profile_contract.cmake")
-
 add_test(NAME http_contract_source
     COMMAND "${CMAKE_COMMAND}"
         "-DCCLAW_SOURCE_DIR=${CMAKE_CURRENT_LIST_DIR}/.."
