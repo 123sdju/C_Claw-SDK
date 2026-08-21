@@ -30,3 +30,7 @@ ESP32 平台需要在 ESP-IDF 工程中配置；产品仓库通过固定版本�
 产品仓库必须依赖发布 tag 或固定 commit，不依赖 SDK 的浮动 `main` 分支。
 
 当前目录是从 CClaw 工程整理出的独立 SDK 初始快照；构建和安装验证尚未在本目录执行。
+
+## License
+
+MIT License，详见根目录 `LICENSE`。`cclaw/` 内的第三方组件仍以其各自的许可证为准。
