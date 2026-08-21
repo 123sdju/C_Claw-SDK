@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: C-Claw
+Description: Pure C agent runtime SDK
+Version: @CCLAW_VERSION@
+Libs: -L${libdir} -lc_claw_runtime
+Cflags: -I${includedir}
