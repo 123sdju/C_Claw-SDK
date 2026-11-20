@@ -7,28 +7,31 @@
 #include "cc/ports/cc_http_client.h"
 #include "cc/util/cc_json.h"
 #include "cc/internal/cc_alloc.h"
+#include "cc/internal/cc_json_fields.h"
+#include "cc/internal/cc_json_syntax_check.h"
 #include "cc/util/cc_network_policy.h"
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 /*
- * http.request 工具私有对象。
- *
- * network_policy 是深拷贝后的策略快照，工具销毁时释放 allowlist。默认策略是 deny，
- * 因此没有显式 allowlist 时不会访问外网，符合核心 SDK “安全优先、业务 gateway 外置”
- * 的边界。
+ * 工具拥有不可变策略快照，借用 HTTP 描述符指针。HTTP owner 覆盖全部调用和回调，
+ * 工具销毁归还允许列表，不销毁 HTTP。缺省无允许项，网络访问由策略拒绝。
  */
 typedef struct {
     cc_http_client_t *http_client;
     cc_network_policy_t network_policy;
 } cc_http_request_tool_t;
 
+/** @brief 复核每次传输 URL。 @param[in] url 同步借用 URL。 @param[in] user_data 存活工具借用。 @return 策略允许为一，缺工具或不允许为零。 */
 static int validate_tool_url(const char *url, void *user_data)
 {
     cc_http_request_tool_t *tool = (cc_http_request_tool_t *)user_data;
     return tool && cc_network_policy_url_allowed(&tool->network_policy, url);
 }
 
+/** @brief 核对 DNS 候选或已连接地址。 @param[in] host 调用期主机借用。 @param[in] numeric_address 调用期数值地址借用。 @param[in] user_data 存活工具借用。 @return 地址策略允许为一，其他为零。 */
 static int validate_tool_address(
     const char *host,
     const char *numeric_address,
@@ -39,20 +42,15 @@ static int validate_tool_address(
         &tool->network_policy, host, numeric_address);
 }
 
-/* 返回工具名；使用带点号的命名空间，方便未来和其它 HTTP-capable 工具区分。 */
+/** @brief 提供稳定注册名。 @param[in] self 忽略的状态借用，可空。 @return 静态只读名称。 */
 static const char *http_req_name(void *self) { (void)self; return "http.request"; }
 
 
-/* 返回工具说明；静态字符串只读使用，不需要调用方释放。 */
+/** @brief 提供模型说明。 @param[in] self 忽略的状态借用，可空。 @return 静态只读描述。 */
 static const char *http_req_description(void *self) { (void)self; return "Make HTTP requests"; }
 
 
-/*
- * 返回 http.request 的参数 schema。
- *
- * url 必填，method/body/timeout_ms 可选；tool executor 的 schema 校验能先挡住缺少 url
- * 这类基础错误，具体 URL 安全仍由 network policy 在执行期检查。
- */
+/** @brief 声明 URL 及可选方法、正文和整数毫秒预算。 @param[in] self 忽略的状态借用，可空。 @return 工具寿命内稳定的 JSON Schema 文本。 */
 static const char *http_req_schema_json(void *self)
 {
     (void)self;
@@ -68,7 +66,7 @@ static const char *http_req_schema_json(void *self)
     "}";
 }
 
-/* 释放 allowlist 深拷贝数组；每个 entry 字符串由工具对象拥有。 */
+/** @brief 消费允许列表及各字符串。 @param[in,out] list 可空独占列表，非零 count 须有对应拥有数组。 @post 字段归还且列表清零，无锁，caller 排空借用。 */
 static void free_allowlist(cc_config_string_list_t *list)
 {
     if (!list) return;
@@ -77,11 +75,11 @@ static void free_allowlist(cc_config_string_list_t *list)
     memset(list, 0, sizeof(*list));
 }
 
-/*
- * 深拷贝 allowlist。
- *
- * 创建工具时不能直接借用 config 中的 allowlist，因为 config 可能在 reload 后销毁；
- * 工具持有自己的策略快照，保证运行中的 tool call 不受外部配置内存生命周期影响。
+/**
+ * @brief 在未发布目标中建立独立允许列表，保留 NULL 项。
+ * @param[in] src 可空稳定列表借用，外层已检查 count/items 与乘法容量。
+ * @param[out] dst 必填新槽，先清零，成功拥有数组和字符串。
+ * @return 成功为一，分配失败清理部分副本并返回零，源始终由 caller 保管。
  */
 static int copy_allowlist(
     const cc_config_string_list_t *src,
@@ -103,12 +101,7 @@ static int copy_allowlist(
     return 1;
 }
 
-/*
- * 公开的 URL allowlist 检查 helper。
- *
- * 测试和下游工具可以复用同一套匹配逻辑；返回 1 表示允许，0 表示拒绝。默认空列表拒绝，
- * localhost/private IP 也会由网络策略层按规则拦截。
- */
+/** @brief 委托允许列表纯检查。 @param[in] network_allowlist 稳定列表借用，NULL/空拒绝。 @param[in] url 调用期 URL 借用。 @return 命中为一，其他为零，旧允许列表入口保留显式列入私网的语义。 */
 int cc_http_request_url_allowed(
     const cc_config_string_list_t *network_allowlist,
     const char *url
@@ -117,12 +110,15 @@ int cc_http_request_url_allowed(
     return cc_network_allowlist_url_allowed(network_allowlist, url);
 }
 
-/*
- * 执行 HTTP 请求工具。
- *
- * 函数把 JSON 参数转换成 cc_http_request_t，然后交给统一 HTTP client 端口。网络访问
- * 在构造 request 前必须先通过 cc_network_policy_url_allowed；HTTP 错误和非 2xx 状态
- * 都作为可恢复 tool error 返回给模型，SDK 不在这里做 retry/backoff。
+/**
+ * @brief 严格校验参数并通过网络策略派发一次禁止自动重试的同步 HTTP 请求。
+ * @param[in] self 必填存活工具借用，HTTP 及不可变策略覆盖 perform 和全部回调。
+ * @param[in] args_json 调用期完整对象，url 必填非空字符串，method/body 可选字符串，timeout_ms 可选可表示整数。
+ * @param[in] ctx 可选调用期上下文，传递取消令牌，正预算限制请求参数所选超时。
+ * @param[out] out_result 必填新对象或已 cleanup 槽，先清零，成功及业务失败拥有字段均交 caller cleanup。
+ * @return 基础地址错误为 INVALID_ARGUMENT，结果构造 OOM 返回 OOM，参数/策略/传输/正文表示或非 2xx 通过 CC_OK 与 ok=0 反馈，诊断交 caller。
+ * @note 参数树保持至 perform 返回，body_size 为正文权威长度，正值精确复制并拒绝 raw NUL，零值输出空正文且不读取 body。
+ * 传输或结果失败可能已有远端副作用，工具不重试，owner 关闭入口并排空调用后销毁。
  */
 static cc_result_t http_req_call(
     void *self,
@@ -131,36 +127,52 @@ static cc_result_t http_req_call(
     cc_tool_result_t *out_result
 )
 {
-    cc_http_request_tool_t *tool = (cc_http_request_tool_t *)self;
-    (void)ctx;
+    if (!out_result) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null HTTP tool result");
     memset(out_result, 0, sizeof(cc_tool_result_t));
-
+    if (!self) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null HTTP tool");
+    cc_http_request_tool_t *tool = (cc_http_request_tool_t *)self;
+    const char *error = "Failed to parse arguments JSON";
+    const char *oom_message = "Failed to allocate HTTP tool result";
     cc_json_value_t *args = NULL;
-    cc_result_t rc = cc_json_parse(args_json, &args);
-    if (rc.code != CC_OK || !args) {
-        out_result->ok = 0;
-        out_result->error = cc_copy_string("Failed to parse arguments JSON");
-        cc_result_free(&rc);
-        return cc_result_ok();
+    cc_json_value_t *result = NULL;
+    char *body_copy = NULL;
+    cc_http_response_t response = {0};
+    cc_result_t rc = cc_result_ok();
+    if (!args_json || cc_storage_json_has_nul_escape(args_json)) goto error;
+    rc = cc_json_parse_strict(args_json, &args);
+    if (rc.code != CC_OK) goto error;
+    const char *fields[] = {"url", "method", "body", "timeout_ms"};
+    if (!cc_json_is_object(args) || cc_json_duplicate_known_field(args, fields, 4)) {
+        error = "HTTP arguments must be an object without duplicate known fields";
+        goto error;
     }
-
     const char *url = cc_json_string_value(cc_json_object_get(args, "url"));
-    const char *method = cc_json_string_value(cc_json_object_get(args, "method"));
-    const char *body = cc_json_string_value(cc_json_object_get(args, "body"));
-    int timeout_ms = cc_json_int_value(cc_json_object_get(args, "timeout_ms"));
-
-    if (!url || strlen(url) == 0) {
-        out_result->ok = 0;
-        out_result->error = cc_copy_string("Missing required parameter: url");
-        cc_json_destroy(args);
-        return cc_result_ok();
+    cc_json_value_t *method_value = cc_json_object_get(args, "method");
+    cc_json_value_t *body_value = cc_json_object_get(args, "body");
+    cc_json_value_t *timeout_value = cc_json_object_get(args, "timeout_ms");
+    const char *method = cc_json_string_value(method_value);
+    const char *body = cc_json_string_value(body_value);
+    long timeout_ms = 0;
+    if (!url || !url[0] || (method_value && !method) || (body_value && !body)) {
+        error = "url must be a nonempty string and method/body must be strings when present";
+        goto error;
     }
-
+    if (timeout_value) {
+        double number = cc_json_number_value(timeout_value);
+        if (!cc_json_is_number(timeout_value) || !(number >= (double)LONG_MIN) ||
+            number >= -(double)LONG_MIN) {
+            error = "timeout_ms must be an integer representable as long";
+            goto error;
+        }
+        timeout_ms = (long)number;
+        if ((double)timeout_ms != number) {
+            error = "timeout_ms must be an integer representable as long";
+            goto error;
+        }
+    }
     if (!cc_network_policy_url_allowed(&tool->network_policy, url)) {
-        out_result->ok = 0;
-        out_result->error = cc_copy_string("Network access denied by http.request allowlist");
-        cc_json_destroy(args);
-        return cc_result_ok();
+        error = "Network access denied by http.request allowlist";
+        goto error;
     }
 
     cc_http_header_t headers[1] = {
@@ -176,11 +188,13 @@ static cc_result_t http_req_call(
     request.body = body;
     request.timeout_ms = timeout_ms > 0 ? timeout_ms :
         (ctx && ctx->timeout_ms > 0 ? ctx->timeout_ms : 30000);
+    if (ctx && ctx->timeout_ms > 0 && request.timeout_ms > ctx->timeout_ms)
+        request.timeout_ms = ctx->timeout_ms;
     request.cancel_token = ctx ? ctx->cancel_token : NULL;
     /* 通用工具不能挤占 LLM 连接池，也不能因 POST/自定义方法重复执行而自动重试。 */
     request.connection_pool = "default";
     request.header_profile = body ? "tool-json-body" : "tool-empty";
-    request.retry_count = 0;
+    request.retry_count = -1;
     request.max_response_bytes = 16U * 1024U;
     request.max_redirects = 5;
     request.validate_url = validate_tool_url;
@@ -188,32 +202,63 @@ static cc_result_t http_req_call(
     request.validate_address = validate_tool_address;
     request.validate_address_user_data = tool;
 
-    cc_http_response_t response;
+    cc_result_free(&rc);
+    oom_message = "HTTP request may have completed, but result allocation failed";
     rc = cc_http_client_perform(tool->http_client, &request, &response);
-    cc_json_destroy(args);
-
     if (rc.code != CC_OK) {
-        out_result->ok = 0;
-        out_result->error = cc_copy_string(rc.message ? rc.message : "HTTP request failed");
-        cc_result_free(&rc);
-        return cc_result_ok();
+        error = rc.message ? rc.message : "HTTP request failed";
+        goto error;
     }
-
-    cc_json_value_t *result = cc_json_create_object();
-    cc_json_object_set(result, "status", cc_json_create_number((double)response.status_code));
-    cc_json_object_set(result, "body", cc_json_create_string(response.body ? response.body : ""));
+    if (response.body_size) {
+        if (!response.body || response.body_size == SIZE_MAX) {
+            error = "HTTP response body has an invalid size";
+            goto error;
+        }
+        if (memchr(response.body, '\0', response.body_size)) {
+            error = "HTTP response contains an embedded NUL and cannot be represented as text; action may have completed";
+            goto error;
+        }
+        body_copy = malloc(response.body_size + 1);
+        if (!body_copy) goto oom;
+        memcpy(body_copy, response.body, response.body_size);
+        body_copy[response.body_size] = '\0';
+    }
+    result = cc_json_create_object();
+    if (!result || !cc_json_object_set_owned(result, "status", cc_json_create_number((double)response.status_code)) ||
+        !cc_json_object_set_owned(result, "body", cc_json_create_string(body_copy ? body_copy : "")))
+        goto oom;
     out_result->text = cc_json_stringify_unformatted(result);
-    cc_json_destroy(result);
-
+    if (!out_result->text) goto oom;
     out_result->ok = (response.status_code >= 200 && response.status_code < 300) ? 1 : 0;
     if (!out_result->ok) {
         out_result->error = cc_copy_string("HTTP status outside 2xx");
+        if (!out_result->error) goto oom;
     }
+    cc_result_free(&rc);
+    rc = cc_result_ok();
+    goto done;
+
+error:
+    out_result->error = cc_copy_string(error);
+    if (!out_result->error) goto oom;
+    cc_result_free(&rc);
+    rc = cc_result_ok();
+    goto done;
+
+oom:
+    cc_result_free(&rc);
+    cc_tool_result_cleanup(out_result);
+    rc = cc_result_error(CC_ERR_OUT_OF_MEMORY, oom_message);
+
+done:
+    cc_json_destroy(args);
+    cc_json_destroy(result);
+    free(body_copy);
     cc_http_response_free(&response);
-    return cc_result_ok();
+    return rc;
 }
 
-/* 销毁 http.request 工具对象，并释放其私有 allowlist 深拷贝。 */
+/** @brief 消费工具及策略副本。 @param[in,out] self 独占状态，可空。 @pre owner 已关闭入口并排空 perform 与回调。 @post 状态及允许列表归还，HTTP 描述符继续归其 owner。 */
 static void http_req_destroy(void *self)
 {
     cc_http_request_tool_t *tool = (cc_http_request_tool_t *)self;
@@ -222,7 +267,7 @@ static void http_req_destroy(void *self)
     free(tool);
 }
 
-/* http.request 的工具 vtable，供 registry 和 tool executor 以统一接口调用。 */
+/* 静态方法表覆盖工具整个生命周期。 */
 static cc_tool_vtable_t http_req_vtable = {
     http_req_name,
     http_req_description,
@@ -231,11 +276,11 @@ static cc_tool_vtable_t http_req_vtable = {
     http_req_destroy
 };
 
-/*
- * 创建默认 http.request 工具。
- *
- * 默认不传 allowlist，因此网络策略为 deny；应用如果确实需要开放网络，必须使用
- * allowlist/policy 版本显式配置。
+/**
+ * @brief 用空允许列表创建缺省拒绝网络的 HTTP 工具。
+ * @param[in] http_client 存活 HTTP 描述符借用，须支持已连接地址验证并覆盖工具寿命。
+ * @param[out] out_tool 必填空描述符，初始化与拥有规则沿完整策略工厂。
+ * @return 完整策略创建结果，诊断由 caller 释放，工具不接管 HTTP 销毁。
  */
 cc_result_t cc_http_request_tool_create(
     cc_http_client_t *http_client,
@@ -244,11 +289,12 @@ cc_result_t cc_http_request_tool_create(
     return cc_http_request_tool_create_with_allowlist(http_client, NULL, out_tool);
 }
 
-/*
- * 用字符串 allowlist 创建 http.request 工具。
- *
- * 该接口是便捷 wrapper，会把 allowlist 包装成 cc_network_policy_t；allowlist entry
- * 支持 host、host:port、*.domain、scheme://host 等格式，匹配规则由 util 层实现。
+/**
+ * @brief 将可选允许列表包装为策略，再创建独立快照工具。
+ * @param[in] http_client 覆盖工具寿命的 HTTP 描述符借用。
+ * @param[in] network_allowlist 创建期稳定列表借用，可空，非零 count 须有对应 items。
+ * @param[out] out_tool 必填空描述符，早期失败输出规则沿完整策略工厂。
+ * @return 参数、能力、容量或分配结果，诊断交 caller，配置副本成功后不再借用原列表。
  */
 cc_result_t cc_http_request_tool_create_with_allowlist(
     cc_http_client_t *http_client,
@@ -263,11 +309,12 @@ cc_result_t cc_http_request_tool_create_with_allowlist(
     return cc_http_request_tool_create_with_policy(http_client, &policy, out_tool);
 }
 
-/*
- * 用完整 network policy 创建 http.request 工具。
- *
- * 成功后 out_tool 持有工具 self/vtable，销毁时释放 policy 深拷贝。policy 只在创建期间
- * 借用，调用返回后调用方可以释放自己的配置对象。
+/**
+ * @brief 验证端口及允许列表形状，复制策略后发布拥有工具。
+ * @param[in] http_client 必填存活端口借用，须有方法表和已连接地址校验能力，使用期由 owner 保持。
+ * @param[in] network_policy 可空创建期借用，列表非零 count 须有 items，NULL 项原样保留，计数须可分配。
+ * @param[out] out_tool 必填空描述符，早期参数/能力/容量失败保留原值，其后清零，成功 self 须 destroy 或注册交接。
+ * @return 参数、UNSUPPORTED、LIMIT_EXCEEDED 或 OOM，失败归还本次副本，诊断交 caller。
  */
 cc_result_t cc_http_request_tool_create_with_policy(
     cc_http_client_t *http_client,
@@ -282,6 +329,10 @@ cc_result_t cc_http_request_tool_create_with_policy(
         return cc_result_error(CC_ERR_UNSUPPORTED,
             "HTTP request tool requires connected-address validation");
     }
+    if (network_policy && network_policy->allowlist.count && !network_policy->allowlist.items)
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "HTTP allowlist has no items");
+    if (network_policy && network_policy->allowlist.count > SIZE_MAX / sizeof(char *))
+        return cc_result_error(CC_ERR_LIMIT_EXCEEDED, "HTTP allowlist size exceeds addressable capacity");
     memset(out_tool, 0, sizeof(*out_tool));
     cc_http_request_tool_t *self = calloc(1, sizeof(cc_http_request_tool_t));
     if (!self) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to create http request tool");

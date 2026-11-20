@@ -5,8 +5,10 @@
 #include "cc/app/cc_skill_catalog.h"
 #include "cc/internal/cc_alloc.h"
 #include "cc/util/cc_string_builder.h"
-#include "cc/internal/cc_alloc.h"
 
+#include <limits.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,7 +27,10 @@ struct cc_skill_catalog {
     size_t capacity;
 };
 
-/* 释放单个 skill 条目。 */
+/** @brief 消费条目拥有的名称、来源和正文并归零。
+ * @param[in,out] entry 可为 NULL 的独占条目，所有读者已退出。
+ * @post 空条目可重复清理，条目结构本身由 catalog 保管。
+ */
 static void free_entry(cc_skill_entry_t *entry)
 {
     if (!entry) return;
@@ -35,12 +40,16 @@ static void free_entry(cc_skill_entry_t *entry)
     memset(entry, 0, sizeof(*entry));
 }
 
-/* 创建空 skill catalog。 */
+/** @brief 创建空技能目录。
+ * @param[out] out_catalog 必填空槽，先置 NULL，成功交付调用者 destroy 的对象。
+ * @return CC_OK、INVALID_ARGUMENT 或 OUT_OF_MEMORY，结果诊断归调用者。
+ */
 cc_result_t cc_skill_catalog_create(cc_skill_catalog_t **out_catalog)
 {
     if (!out_catalog) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null skill catalog output");
     }
+    *out_catalog = NULL;
     cc_skill_catalog_t *catalog = calloc(1, sizeof(*catalog));
     if (!catalog) {
         return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to create skill catalog");
@@ -49,7 +58,10 @@ cc_result_t cc_skill_catalog_create(cc_skill_catalog_t **out_catalog)
     return cc_result_ok();
 }
 
-/* 销毁 catalog 和所有已加载 skill。 */
+/** @brief 消费技能目录及全部条目。
+ * @param[in,out] catalog 可为 NULL 的拥有对象，调用者变量不自动清空。
+ * @pre 所有加载、列名和提示构建调用均已退出，对象无内部锁。
+ */
 void cc_skill_catalog_destroy(cc_skill_catalog_t *catalog)
 {
     if (!catalog) return;
@@ -60,11 +72,18 @@ void cc_skill_catalog_destroy(cc_skill_catalog_t *catalog)
     free(catalog);
 }
 
-/* 确保 catalog 有可写槽位。 */
+/** @brief 为新条目扩容并核对容量运算。
+ * @param[in,out] catalog 必填独占目录。
+ * @return 具有可写槽为 1，乘法容量不可表示或 realloc 失败为 0，失败保留旧数组。
+ */
 static int ensure_capacity(cc_skill_catalog_t *catalog)
 {
     if (catalog->count < catalog->capacity) return 1;
-    size_t next_capacity = catalog->capacity ? catalog->capacity * 2 : 8;
+    size_t limit = SIZE_MAX / sizeof(*catalog->entries);
+    if (limit > (size_t)LONG_MAX) limit = (size_t)LONG_MAX;
+    if (catalog->capacity > limit / 2U) return 0;
+    size_t next_capacity = catalog->capacity ? catalog->capacity * 2U : 8U;
+    if (next_capacity > limit) return 0;
     cc_skill_entry_t *next = realloc(catalog->entries, next_capacity * sizeof(*next));
     if (!next) return 0;
     memset(next + catalog->capacity, 0, (next_capacity - catalog->capacity) * sizeof(*next));
@@ -73,7 +92,11 @@ static int ensure_capacity(cc_skill_catalog_t *catalog)
     return 1;
 }
 
-/* 按 skill 名称查找现有条目。 */
+/** @brief 按完整名称查找技能。
+ * @param[in] catalog 必填调用期稳定目录。
+ * @param[in] name 必填 NUL 名称借用，比较区分大小写。
+ * @return 找到返回非负数组下标，否则为 -1，容量保证下标可由 long 表示。
+ */
 static long find_skill(cc_skill_catalog_t *catalog, const char *name)
 {
     for (size_t i = 0; i < catalog->count; i++) {
@@ -84,13 +107,18 @@ static long find_skill(cc_skill_catalog_t *catalog, const char *name)
     return -1;
 }
 
-/* 拼接两个 POSIX 风格路径片段；返回值由调用方 free()。 */
+/** @brief 按斜杠拼接两个路径片段。
+ * @param[in] a 必填 NUL 父路径，可为空串。
+ * @param[in] b 必填 NUL 后缀，不执行路径规范化或根约束。
+ * @return 调用者 free 的拥有路径，NULL 输入、容量溢出或分配失败返回 NULL。
+ */
 static char *join_path2(const char *a, const char *b)
 {
     if (!a || !b) return NULL;
     size_t alen = strlen(a);
     size_t blen = strlen(b);
     int need_slash = alen > 0 && a[alen - 1] != '/';
+    if (alen > SIZE_MAX - blen || alen + blen > SIZE_MAX - (size_t)need_slash - 1U) return NULL;
     char *out = malloc(alen + (need_slash ? 1 : 0) + blen + 1);
     if (!out) return NULL;
     memcpy(out, a, alen);
@@ -101,7 +129,10 @@ static char *join_path2(const char *a, const char *b)
     return out;
 }
 
-/* 构造用户 home 下的默认 skill 目录。 */
+/** @brief 从进程 HOME 构造默认技能路径。
+ * @return HOME 存在时返回调用者 free 的路径，HOME 缺失/空或分配失败返回 NULL。
+ * @pre 调用期间环境变量保持稳定，缺失与分配失败由外层结合 HOME 区分。
+ */
 static char *home_skill_dir(void)
 {
     const char *home = getenv("HOME");
@@ -109,11 +140,14 @@ static char *home_skill_dir(void)
     return join_path2(home, ".cclaw/skills");
 }
 
-/*
- * 插入或更新 skill。
- *
- * 同名 skill 后加载会覆盖先加载内容，这让 workspace/plugin skill 可以按加载顺序替换
- * 默认 skill。name 首次插入后保持不变，内容和 source_path 可更新。
+/**
+ * @brief 复制完整条目后原子替换同名技能。
+ * @param[in,out] catalog 必填独占目录，NULL 按跳过。
+ * @param[in] name 必填名称借用，NULL 按跳过。
+ * @param[in] source_path 可为 NULL 的来源路径，NULL 保存空串。
+ * @param[in] content 必填正文借用，NULL 按跳过。
+ * @return CC_OK 或 OUT_OF_MEMORY，失败保留原条目及 count。
+ * @post 成功条目完全拥有副本，后加载同名覆盖早先内容。
  */
 static cc_result_t upsert_skill(
     cc_skill_catalog_t *catalog,
@@ -124,38 +158,32 @@ static cc_result_t upsert_skill(
 {
     if (!catalog || !name || !content) return cc_result_ok();
     long index = find_skill(catalog, name);
-    cc_skill_entry_t *entry = NULL;
-    if (index >= 0) {
-        entry = &catalog->entries[index];
-        free(entry->source_path);
-        free(entry->content);
-        entry->source_path = NULL;
-        entry->content = NULL;
-    } else {
-        if (!ensure_capacity(catalog)) {
-            return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to grow skill catalog");
-        }
-        entry = &catalog->entries[catalog->count++];
-        entry->name = cc_copy_string(name);
-        if (!entry->name) {
-            catalog->count--;
-            return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to copy skill name");
-        }
-    }
-
-    entry->source_path = source_path ? cc_copy_string(source_path) : cc_copy_string("");
-    entry->content = cc_copy_string(content);
-    if (!entry->source_path || !entry->content) {
+    cc_skill_entry_t replacement = {0};
+    replacement.name = cc_copy_string(name);
+    replacement.source_path = cc_copy_string(source_path ? source_path : "");
+    replacement.content = cc_copy_string(content);
+    if (!replacement.name || !replacement.source_path || !replacement.content) {
+        free_entry(&replacement);
         return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to copy skill content");
     }
+    if (index < 0 && !ensure_capacity(catalog)) {
+        free_entry(&replacement);
+        return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to grow skill catalog");
+    }
+    cc_skill_entry_t *entry = index >= 0 ? &catalog->entries[index] : &catalog->entries[catalog->count++];
+    free_entry(entry);
+    *entry = replacement;
     return cc_result_ok();
 }
 
-/*
- * 从一个目录加载 skills。
- *
- * 目录下每个子目录的 SKILL.md 被视为一个 skill，子目录名作为 skill 名。缺失目录、
- * 不支持 list/read 或单个文件读取失败都按可恢复 no-op 处理。
+/**
+ * @brief 列出一级子项并读取各自 SKILL.md。
+ * @param[in,out] catalog 可为空，非空时由当前调用独占。
+ * @param[in] fs 可为空的调用期端口借用，list/read 缺失时跳过，exists 可选。
+ * @param[in] dir 可为空或空串的目录借用，此时跳过。
+ * @return 缺失目录和普通读取失败跳过，分配/容量失败返回 OUT_OF_MEMORY。
+ * @post 已成功加载的条目保留，临时路径、正文及整份列名结果均回收。
+ * @note 使用普通 read_text，目录与文件为调用者信任的提示来源，读取预算由后端决定。
  */
 static cc_result_t load_skill_dir(
     cc_skill_catalog_t *catalog,
@@ -166,10 +194,11 @@ static cc_result_t load_skill_dir(
     if (!catalog || !fs || !fs->vtable || !dir || !dir[0]) return cc_result_ok();
     if (!fs->vtable->list_dir || !fs->vtable->read_text) return cc_result_ok();
 
-    int exists = 0;
+    int exists = 1;
     cc_result_t rc = fs->vtable->exists ?
         fs->vtable->exists(fs->self, dir, &exists) : cc_result_ok();
     if (rc.code != CC_OK || !exists) {
+        if (rc.code == CC_ERR_OUT_OF_MEMORY) return rc;
         cc_result_free(&rc);
         return cc_result_ok();
     }
@@ -179,6 +208,7 @@ static cc_result_t load_skill_dir(
     size_t count = 0;
     rc = fs->vtable->list_dir(fs->self, dir, &items, &count);
     if (rc.code != CC_OK) {
+        if (rc.code == CC_ERR_OUT_OF_MEMORY) return rc;
         cc_result_free(&rc);
         return cc_result_ok();
     }
@@ -187,31 +217,34 @@ static cc_result_t load_skill_dir(
         char *skill_dir = join_path2(dir, items[i]);
         char *skill_md = skill_dir ? join_path2(skill_dir, "SKILL.md") : NULL;
         char *content = NULL;
-        if (skill_md) {
+        if (!skill_dir || !skill_md) {
+            rc = cc_result_error(CC_ERR_OUT_OF_MEMORY, "Cannot allocate skill path");
+        } else {
             cc_result_t read_rc = fs->vtable->read_text(fs->self, skill_md, &content);
             if (read_rc.code == CC_OK && content && content[0]) {
-                cc_result_t add_rc = upsert_skill(catalog, items[i], skill_md, content);
-                if (add_rc.code != CC_OK) {
-                    for (size_t j = 0; j < count; j++) free(items[j]);
-                    free(items);
-                    free(skill_dir);
-                    free(skill_md);
-                    free(content);
-                    return add_rc;
-                }
+                rc = upsert_skill(catalog, items[i], skill_md, content);
+            } else if (read_rc.code == CC_ERR_OUT_OF_MEMORY) {
+                rc = read_rc;
+                read_rc = cc_result_ok();
             }
             cc_result_free(&read_rc);
         }
         free(content);
         free(skill_dir);
         free(skill_md);
-        free(items[i]);
+        if (rc.code != CC_OK) break;
     }
+    for (size_t i = 0; i < count; i++) free(items[i]);
     free(items);
-    return cc_result_ok();
+    return rc;
 }
 
-/* 加载 plugin 配置中声明的 skill_dirs。 */
+/** @brief 按插件条目及目录顺序追加技能。
+ * @param[in,out] catalog 必填独占目录。
+ * @param[in] fs 调用期文件系统借用。
+ * @param[in] config 可为 NULL 的稳定配置，NULL 跳过。
+ * @return 首个加载错误或 CC_OK，前序成功条目保留。
+ */
 static cc_result_t load_plugin_skill_dirs(
     cc_skill_catalog_t *catalog,
     cc_filesystem_t *fs,
@@ -229,11 +262,13 @@ static cc_result_t load_plugin_skill_dirs(
     return cc_result_ok();
 }
 
-/*
- * 按配置加载所有 skill 来源。
- *
- * 加载顺序包括用户 home、agent 默认目录、plugin skill_dirs、extra_dirs 和 workspace
- * .agents/skills。后加载同名 skill 会覆盖先前内容。
+/**
+ * @brief 按 HOME、agent、插件、extra、workspace 顺序装入技能。
+ * @param[in,out] catalog 必填独占目录，旧条目继续保留并允许同名覆盖。
+ * @param[in] filesystem 必填调用期文件系统借用。
+ * @param[in] config 必填稳定配置，目录字符串与数组在调用内借用。
+ * @return CC_OK、INVALID_ARGUMENT 或加载分配错误，先前成功条目继续有效。
+ * @note 正文作为任务指令注入，调用方负责信任配置及文件来源，catalog 本身无字节预算或沙箱。
  */
 cc_result_t cc_skill_catalog_load_from_config(
     cc_skill_catalog_t *catalog,
@@ -248,12 +283,16 @@ cc_result_t cc_skill_catalog_load_from_config(
 
 
     char *home_dir = home_skill_dir();
+    const char *home = getenv("HOME");
+    if (home && home[0] && !home_dir)
+        return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Cannot allocate home skill path");
     cc_result_t rc = load_skill_dir(catalog, filesystem, home_dir);
     free(home_dir);
     if (rc.code != CC_OK) return rc;
 
     if (config->agents.defaults.agent_dir) {
         char *personal = join_path2(config->agents.defaults.agent_dir, "skills");
+        if (!personal) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Cannot allocate agent skill path");
         rc = load_skill_dir(catalog, filesystem, personal);
         free(personal);
         if (rc.code != CC_OK) return rc;
@@ -269,6 +308,7 @@ cc_result_t cc_skill_catalog_load_from_config(
 
     if (config->workspace_path) {
         char *agents = join_path2(config->workspace_path, ".agents/skills");
+        if (!agents) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Cannot allocate workspace skill path");
         rc = load_skill_dir(catalog, filesystem, agents);
         free(agents);
         if (rc.code != CC_OK) return rc;
@@ -276,7 +316,11 @@ cc_result_t cc_skill_catalog_load_from_config(
     return cc_result_ok();
 }
 
-/* 判断 skill 是否在 allowlist 中；空 allowlist 表示全部允许。 */
+/** @brief 判断完整技能名是否通过允许列表。
+ * @param[in] allowlist 可为 NULL，NULL 或零项允许全部，非空数组须有效。
+ * @param[in] name 名称借用，NULL 仅在允许全部时通过。
+ * @return 允许为 1，否则为 0，比较区分大小写。
+ */
 static int allow_skill(const cc_config_string_list_t *allowlist, const char *name)
 {
     if (!allowlist || allowlist->count == 0) return 1;
@@ -286,11 +330,13 @@ static int allow_skill(const cc_config_string_list_t *allowlist, const char *nam
     return 0;
 }
 
-/*
- * 构建 skill prompt 片段。
- *
- * 只把 allowlist 允许的 skill 写入 prompt；没有可用 skill 时返回 NULL prompt，避免向
- * system prompt 注入空标题。
+/**
+ * @brief 为允许的技能构建系统提示片段。
+ * @param[in] catalog 可为 NULL 的调用期稳定目录，NULL/空目录成功返回空输出。
+ * @param[in] allowlist 可为 NULL 的稳定名单，NULL/零项允许全部。
+ * @param[out] out_prompt 必填空槽，先置 NULL，成功字符串由调用者 free。
+ * @return CC_OK 或参数/构建器容量/分配错误，全被过滤返回 NULL。
+ * @pre 目录禁止并发加载或销毁，调用者将内容当作可信指令并承担总提示预算。
  */
 cc_result_t cc_skill_catalog_build_prompt(
     cc_skill_catalog_t *catalog,
@@ -308,14 +354,17 @@ cc_result_t cc_skill_catalog_build_prompt(
     cc_result_t rc = cc_string_builder_init(&sb);
     if (rc.code != CC_OK) return rc;
     cc_result_free(&rc);
-    cc_string_builder_append(&sb, "\n\n[Skills]\n");
-    cc_string_builder_append(&sb,
-        "The following SKILL.md files are available for this agent. "
-        "Use them as task-specific operating instructions when relevant.\n");
-
+    bool included = false;
     for (size_t i = 0; i < catalog->count; i++) {
         cc_skill_entry_t *entry = &catalog->entries[i];
         if (!allow_skill(allowlist, entry->name)) continue;
+        if (!included) {
+            cc_string_builder_append(&sb, "\n\n[Skills]\n");
+            cc_string_builder_append(&sb,
+                "The following SKILL.md files are available for this agent. "
+                "Use them as task-specific operating instructions when relevant.\n");
+            included = true;
+        }
         cc_string_builder_appendf(&sb, "\n## %s\n", entry->name ? entry->name : "skill");
         cc_string_builder_append(&sb, entry->content ? entry->content : "");
         size_t content_len = entry->content ? strlen(entry->content) : 0U;
@@ -329,8 +378,7 @@ cc_result_t cc_skill_catalog_build_prompt(
         cc_string_builder_deinit(&sb);
         return cc_result_error(builder_error, "Failed to build skill prompt");
     }
-    const char *text = cc_string_builder_cstr(&sb);
-    if (!text || strlen(text) <= strlen("\n\n[Skills]\n")) {
+    if (!included) {
         cc_string_builder_deinit(&sb);
         return cc_result_ok();
     }
@@ -339,7 +387,13 @@ cc_result_t cc_skill_catalog_build_prompt(
         cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to build skill prompt");
 }
 
-/* 列出 catalog 中的 skill 名称，返回数组和字符串由调用方释放。 */
+/** @brief 按首次插入顺序复制全部技能名称。
+ * @param[in] catalog 可为 NULL 的稳定目录，NULL/空目录交付空结果。
+ * @param[out] out_names 必填空槽，参数有效后先置 NULL，成功逐项及数组均由调用者 free。
+ * @param[out] out_count 必填计数槽，参数有效后先置零，单位为名称条数。
+ * @return CC_OK 或参数、分配错误，失败回收全部部分副本。
+ * @pre 目录禁止并发加载或销毁。
+ */
 cc_result_t cc_skill_catalog_list_names(
     cc_skill_catalog_t *catalog,
     char ***out_names,

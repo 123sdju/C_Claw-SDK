@@ -5,20 +5,32 @@
 #include <stdio.h>
 #include <string.h>
 
-/* 空安全字符串相等 helper，减少断言处重复判空。 */
+/**
+ * @brief 比较两个可选字符串。
+ * @param[in] a 调用期 NUL 借用，可 NULL。
+ * @param[in] b 调用期 NUL 借用，可 NULL。
+ * @return 均非空且内容相同为一，其他零，无分配。
+ */
 static int streq(const char *a, const char *b)
 {
     return a && b && strcmp(a, b) == 0;
 }
 
-/* 写入临时非法配置并断言 cc_config_load 返回 invalid argument 且 message 命中关键字。 */
+/**
+ * @brief 写入非法配置并核对参数错误及诊断片段。
+ * @param[in] json 调用期 NUL JSON 借用。
+ * @param[in] needle 调用期非 NULL 诊断子串借用。
+ * @return 文件写入、关闭及错误匹配成功一，其他零，配置与诊断始终消费。
+ * @note 当前测试进程独占固定临时路径，返回前尝试删除文件。
+ */
 static int load_invalid_config_fails(const char *json, const char *needle)
 {
     const char *path = "__c_claw_invalid_config_test__.json";
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
-    fputs(json, f);
-    fclose(f);
+    int written = fputs(json, f) >= 0;
+    int closed = fclose(f) == 0;
+    if (!written || !closed) { remove(path); return 0; }
 
     cc_config_t config;
     cc_result_t rc = cc_config_load(path, &config);
@@ -31,14 +43,21 @@ static int load_invalid_config_fails(const char *json, const char *needle)
     return ok;
 }
 
-/* 写入临时配置并断言返回指定错误码和错误信息关键字。 */
+/**
+ * @brief 写入配置并核对指定失败码及诊断片段。
+ * @param[in] json 调用期 NUL 正文借用。
+ * @param[in] code 期望失败码。
+ * @param[in] needle 非 NULL 诊断子串借用。
+ * @return 写入完整且错误匹配一，否则零，清理配置、结果及独占临时文件。
+ */
 static int load_config_fails(const char *json, cc_error_code_t code, const char *needle)
 {
     const char *path = "__c_claw_unsupported_config_test__.json";
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
-    fputs(json, f);
-    fclose(f);
+    int written = fputs(json, f) >= 0;
+    int closed = fclose(f) == 0;
+    if (!written || !closed) { remove(path); return 0; }
 
     cc_config_t config;
     cc_result_t rc = cc_config_load(path, &config);
@@ -51,34 +70,40 @@ static int load_config_fails(const char *json, cc_error_code_t code, const char 
     return ok;
 }
 
-/* 写入临时合法配置并加载到调用方提供的 config，成功后由调用方 destroy。 */
+/**
+ * @brief 完整写入合法配置并交付解析拥有对象。
+ * @param[in] json 调用期 NUL JSON 借用。
+ * @param[out] config 必填新配置槽，成功由调用者 destroy，加载失败本函数清理。
+ * @return 写入及加载成功一，否则零，结果诊断与临时文件在返回前消费。
+ */
 static int load_config_ok(const char *json, cc_config_t *config)
 {
     const char *path = "__c_claw_supported_config_test__.json";
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
-    fputs(json, f);
-    fclose(f);
+    int written = fputs(json, f) >= 0;
+    int closed = fclose(f) == 0;
+    if (!written || !closed) { remove(path); return 0; }
 
     cc_result_t rc = cc_config_load(path, config);
     remove(path);
     int ok = rc.code == CC_OK;
     cc_result_free(&rc);
+    if (!ok) cc_config_destroy(config);
     return ok;
 }
 
-/*
- * 验证 runtime 相关配置 section。
- *
- * 覆盖 queue/agents/tools/plugins/skills/MCP/active memory/multimodal 的解析、默认裁剪宏下
- * 的 unsupported 行为，以及几个关键非法配置的校验错误。
+/**
+ * @brief 验证 runtime 各配置区、功能裁剪和非法 MCP/plugin 参数。
+ * @return 全部字段和错误断言通过零，其他一，成功路径清理拥有配置和独占临时文件。
+ * @note 测试串行写固定路径，功能宏选择多模态成功或不支持分支，真实解析器执行。
  */
 int main(void)
 {
     const char *path = "__c_claw_runtime_sections_test__.json";
     FILE *f = fopen(path, "wb");
     if (!f) return 1;
-    fputs(
+    int written = fputs(
         "{"
         "\"queue\":{\"lanes\":{\"main\":2,\"subagent\":3,\"plugin\":4,\"mcp\":5},"
         "\"perSessionConcurrency\":1,\"mode\":\"collect\",\"debounceMs\":125,"
@@ -103,13 +128,15 @@ int main(void)
         "\"memory\":{\"active\":{\"enabled\":true,\"writeSummary\":true,"
         "\"maxValueChars\":256,\"category\":\"turn_summary\"}}"
         "}", f);
-    fclose(f);
+    int closed = fclose(f) == 0;
+    if (written < 0 || !closed) { remove(path); return 1; }
 
     cc_config_t config;
     cc_result_t rc = cc_config_load(path, &config);
     remove(path);
     if (rc.code != CC_OK) {
         cc_result_free(&rc);
+        cc_config_destroy(&config);
         return 1;
     }
     cc_result_free(&rc);

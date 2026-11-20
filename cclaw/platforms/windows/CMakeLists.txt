@@ -11,7 +11,8 @@ add_library(c_claw_platform_windows_objects OBJECT
 )
 
 set(CC_PLATFORM_PUBLIC_INCLUDE_DIRS "")
-set(CC_PLATFORM_PUBLIC_LIBRARIES "")
+# runtime 直接收集对象文件，原生系统依赖由父目录显式转发给最终消费者。
+set(CC_PLATFORM_PUBLIC_LIBRARIES advapi32 bcrypt ws2_32)
 
 if(CC_NEEDS_HTTP_CLIENT)
     find_package(CURL QUIET)
@@ -61,3 +62,8 @@ endif()
 
 set(CC_PLATFORM_PUBLIC_INCLUDE_DIRS ${CC_PLATFORM_PUBLIC_INCLUDE_DIRS} PARENT_SCOPE)
 set(CC_PLATFORM_PUBLIC_LIBRARIES ${CC_PLATFORM_PUBLIC_LIBRARIES} PARENT_SCOPE)
+#[[
+  @file 组装 Windows 平台对象及条件进程、CURL 实现。
+  CURL 系统包或手工库必须与所用头和目标 ABI 匹配，仓内头供显式回退路径使用。
+  系统库与 HTTP 库经父作用域转交 runtime，最终消费者负责完成原生链接。
+]]

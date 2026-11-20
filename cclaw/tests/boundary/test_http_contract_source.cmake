@@ -29,6 +29,7 @@ foreach(required IN ITEMS
         "getpeername"
         "http_abort_from_event"
         "esp_http_client_close"
+        "body_callback_error"
         "http_redirect_headers"
         "CC_HTTP_CAP_RESOLVED_ADDRESS_VALIDATION"
         "CC_HTTP_CAP_REDIRECT_VALIDATION")
@@ -40,7 +41,7 @@ endforeach()
 
 foreach(required IN ITEMS
         "request.connection_pool = \"default\""
-        "request.retry_count = 0")
+        "request.retry_count = -1")
     string(FIND "${http_tool_text}" "${required}" found_index)
     if(found_index EQUAL -1)
         message(FATAL_ERROR "http.request contract missing: ${required}")
@@ -56,7 +57,26 @@ foreach(required IN ITEMS
     endif()
 endforeach()
 
+set(OPENAI_PROVIDER "${CCLAW_SOURCE_DIR}/adapters/src/llm/cc_openai_provider.c")
+if(NOT EXISTS "${OPENAI_PROVIDER}")
+    message(FATAL_ERROR "Missing OpenAI provider source")
+endif()
+file(READ "${OPENAI_PROVIDER}" openai_provider_text)
+foreach(required IN ITEMS
+        "expected array or null"
+        "cc_json_is_null(tool_calls)"
+        "OpenAI stream tool_calls has invalid type")
+    string(FIND "${openai_provider_text}" "${required}" found_index)
+    if(found_index EQUAL -1)
+        message(FATAL_ERROR "OpenAI stream compatibility contract missing: ${required}")
+    endif()
+endforeach()
+
 string(FIND "${posix_http_text}" "next_http_attempt_id" found_index)
 if(found_index EQUAL -1)
     message(FATAL_ERROR "POSIX attempt id contract missing")
 endif()
+#[[
+  @file 从 CCLAW_SOURCE_DIR 读取 HTTP 相关源码并验证必要契约片段。
+  检查覆盖静态文本，缺失文件或片段时终止脚本，读取内容只在本次进程中保留。
+]]

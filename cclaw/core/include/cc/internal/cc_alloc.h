@@ -4,7 +4,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 深拷贝 NUL 结尾字符串；返回堆上副本，调用方用 free() 释放；src 为 NULL 时返回 NULL。 */
+/**
+ * @brief 深拷贝借用的 C 字符串及终止符。
+ * @param[in] src 调用期间稳定的 NUL 结尾字符串，可为 NULL。
+ * @return 成功返回独占堆副本，源为空或分配失败返回 NULL，调用者最终 free。
+ * @note 源须覆盖首个 NUL 的完整范围，函数不保留借用，无共享可变状态。
+ */
 static inline char *cc_copy_string(const char *src)
 {
     if (!src) return NULL;

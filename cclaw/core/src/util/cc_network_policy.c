@@ -1,6 +1,7 @@
 #include "cc/util/cc_network_policy.h"
 
 #include <ctype.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,7 +12,12 @@ typedef struct url_parts {
     int has_userinfo;
 } url_parts_t;
 
-/* ASCII 忽略大小写比较；URL scheme/host 不依赖 locale。 */
+/**
+ * @brief 比较完整 ASCII scheme 或 host，忽略 ASCII 字母大小写。
+ * @param[in] a 可选稳定 NUL 结尾文本。
+ * @param[in] b 可选稳定 NUL 结尾文本。
+ * @return 两个非 NULL 文本完整匹配为一，其他为零，不修改输入且不依赖 locale。
+ */
 static int ascii_case_equal(const char *a, const char *b)
 {
     if (!a || !b) return 0;
@@ -25,11 +31,11 @@ static int ascii_case_equal(const char *a, const char *b)
     return *a == '\0' && *b == '\0';
 }
 
-/*
- * 解析端口号。
- *
- * 只接受 0..65535 的十进制端口，并通过 end_out 告诉调用方解析停止位置，便于检查
- * host:port 后面是否还有非法字符。
+/**
+ * @brief 读取连续十进制端口并在越过 65535 时停止报错。
+ * @param[in] text 可选稳定文本，首字节须为数字。
+ * @param[out] end_out 可选借用游标槽，仅成功时指向首个非数字或 NUL。
+ * @return 0..65535 为成功端口，空输入、非数字或越界为 -1。
  */
 static int parse_port(const char *text, const char **end_out)
 {
@@ -45,11 +51,12 @@ static int parse_port(const char *text, const char **end_out)
     return port;
 }
 
-/*
- * 解析 URL 的 scheme/host/port。
- *
- * 只接受包含 scheme://authority 的 URL，拒绝 userinfo，支持 IPv6 方括号和显式端口。
- * 该函数不解析 path/query，因为 allowlist 只按网络端点做安全决策。
+/**
+ * @brief 从 URL 拆出有界 scheme、host 和显式端口，拒绝 userinfo。
+ * @param[in] url 可选稳定 NUL 结尾文本，必须含 scheme 和非空 authority。
+ * @param[out] out 必填独占输出，先清零并把未显式指定端口置 -1，失败可能保留部分字段。
+ * @return 结构及容量检查通过为一，其他为零，输出按值保存并剥离 IPv6 方括号。
+ * @note path、query、fragment 只用于确定 authority 结尾，未补默认端口或执行 DNS。
  */
 static int parse_url_parts(const char *url, url_parts_t *out)
 {
@@ -110,11 +117,11 @@ static int parse_url_parts(const char *url, url_parts_t *out)
     return 1;
 }
 
-/*
- * 解析 allowlist 条目。
- *
- * 条目可以是 host、host:port、*.domain、scheme://host 或 scheme://host:port；没有 scheme
- * 时只限制 host/port。无效条目直接忽略，避免配置拼写错误变成放行。
+/**
+ * @brief 解析带可选 scheme 或单个端口分隔符的 allowlist 条目。
+ * @param[in] entry 可选稳定文本，裸 IPv6 可作为 host，带 IPv6 端口使用 scheme://[host]:port。
+ * @param[out] out 必填独占按值输出，非空有效输入才开始初始化，失败后不依赖其内容。
+ * @return 可解析且容量足够为一，空、端口错误或过长为零，缺省 scheme/port 保留通配含义。
  */
 static int parse_allow_entry(const char *entry, url_parts_t *out)
 {
@@ -138,10 +145,11 @@ static int parse_allow_entry(const char *entry, url_parts_t *out)
     return 1;
 }
 
-/*
- * 判断 host 是否匹配模式。
- *
- * "*.domain" 只匹配子域，不匹配 domain 自身；普通模式做忽略大小写精确匹配。
+/**
+ * @brief 对 host 执行完整 ASCII 匹配或星点域名后缀匹配。
+ * @param[in] host 可选稳定主机名文本。
+ * @param[in] pattern 可选稳定模式，*.domain 要求 host 在点号后缀前另有至少一个字节。
+ * @return 匹配为一，NULL、空模式或不匹配为零，星点模式允许多级子域。
  */
 static int host_matches_pattern(const char *host, const char *pattern)
 {
@@ -156,7 +164,12 @@ static int host_matches_pattern(const char *host, const char *pattern)
     return ascii_case_equal(host, pattern);
 }
 
-/* 解析 dotted IPv4；成功写入 4 个字节。 */
+/**
+ * @brief 解析四段完整十进制 IPv4，逐段检查 0..255。
+ * @param[in] host 必填稳定 NUL 结尾文本，允许十进制前导零。
+ * @param[out] out 至少四字节的独占输出，失败可能写入前几段。
+ * @return 四段和全文均消费成功为一，其他为零。
+ */
 static int parse_ipv4(const char *host, unsigned char out[4])
 {
     const char *p = host;
@@ -177,11 +190,109 @@ static int parse_ipv4(const char *host, unsigned char out[4])
     return *p == '\0';
 }
 
-/*
- * 判断 host 是否属于默认拒绝的本地/私有网络。
- *
- * 包含 localhost、IPv6 loopback、IPv4 loopback、RFC1918、link-local。域名不会做 DNS
- * 解析，因此这里无法发现解析后落到私网的情况，HTTP adapter 仍应在连接层保持警惕。
+/**
+ * @brief 将一个 ASCII 十六进制字符转换为数值。
+ * @param[in] c 输入字节。
+ * @return 合法数字为 0..15，其他为 -1。
+ */
+static int hex_value(unsigned char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/**
+ * @brief 解析完整数值 IPv6，支持一次双冒号压缩及末尾 dotted IPv4。
+ * @param[in] host 可选稳定文本，接收去方括号的地址，未处理 zone 标记。
+ * @param[out] out 可选八个 16 位字的独占输出，有效参数先清零，失败可能保留部分字。
+ * @return 合法完整地址为一，空参数、分组、压缩或尾部错误为零。
+ */
+static int parse_ipv6(const char *host, uint16_t out[8])
+{
+    if (!host || !out) return 0;
+    size_t count = 0;
+    size_t compressed_at = SIZE_MAX;
+    const char *p = host;
+    memset(out, 0, 8U * sizeof(*out));
+
+    if (*p == ':') {
+        if (p[1] != ':') return 0;
+        compressed_at = 0;
+        p += 2;
+    }
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        const char *colon = strchr(p, ':');
+        if (dot && (!colon || dot < colon)) {
+            unsigned char ipv4[4];
+            if (count > 6 || !parse_ipv4(p, ipv4)) return 0;
+            out[count++] = (uint16_t)(((uint16_t)ipv4[0] << 8) | ipv4[1]);
+            out[count++] = (uint16_t)(((uint16_t)ipv4[2] << 8) | ipv4[3]);
+            p += strlen(p);
+            break;
+        }
+        if (count >= 8) return 0;
+        unsigned value = 0;
+        unsigned digits = 0;
+        while (*p) {
+            int digit = hex_value((unsigned char)*p);
+            if (digit < 0) break;
+            if (++digits > 4) return 0;
+            value = (value << 4) | (unsigned)digit;
+            p++;
+        }
+        if (digits == 0) return 0;
+        out[count++] = (uint16_t)value;
+        if (*p == ':') {
+            p++;
+            if (*p == ':') {
+                if (compressed_at != SIZE_MAX) return 0;
+                compressed_at = count;
+                p++;
+                if (!*p) break;
+            } else if (!*p) {
+                return 0;
+            }
+        } else if (*p) {
+            return 0;
+        }
+    }
+
+    if (compressed_at != SIZE_MAX) {
+        if (count >= 8) return 0;
+        size_t tail_count = count - compressed_at;
+        size_t tail_at = 8U - tail_count;
+        memmove(out + tail_at, out + compressed_at, tail_count * sizeof(*out));
+        for (size_t i = compressed_at; i < tail_at; i++) out[i] = 0;
+        return 1;
+    }
+    return count == 8;
+}
+
+/**
+ * @brief 按当前固定网段规则分类 IPv4 本地、私有、共享、测试和组播地址。
+ * @param[in] ip 必填四字节稳定地址。
+ * @return 命中拒绝网段为一，其他为零，具体范围以函数内字节比较为准。
+ */
+static int is_private_ipv4(const unsigned char ip[4])
+{
+    if (ip[0] == 0 || ip[0] == 10 || ip[0] == 127) return 1;
+    if (ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127) return 1;
+    if (ip[0] == 169 && ip[1] == 254) return 1;
+    if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) return 1;
+    if (ip[0] == 192 && ip[1] == 168) return 1;
+    if (ip[0] == 198 && (ip[1] == 18 || ip[1] == 19)) return 1;
+    if (ip[0] >= 224) return 1;
+    return 0;
+}
+
+/**
+ * @brief 对 localhost、数值 IPv4/IPv6 和 IPv4 嵌入地址应用本地范围分类。
+ * @param[in] host 可选稳定去括号文本，NULL 保守返回一。
+ * @return 本地、私有或固定拒绝范围为一，其他域名和无法解析的地址为零。
+ * @note 此处不执行 DNS，IPv4 mapped 和旧式 compatible 地址按最后四字节分类。
  */
 static int is_private_host(const char *host)
 {
@@ -191,16 +302,41 @@ static int is_private_host(const char *host)
         ascii_case_equal(host, "0:0:0:0:0:0:0:1")) {
         return 1;
     }
-    unsigned char ip[4];
-    if (!parse_ipv4(host, ip)) return 0;
-    if (ip[0] == 10) return 1;
-    if (ip[0] == 127) return 1;
-    if (ip[0] == 169 && ip[1] == 254) return 1;
-    if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) return 1;
-    if (ip[0] == 192 && ip[1] == 168) return 1;
+    unsigned char ipv4[4];
+    if (parse_ipv4(host, ipv4)) return is_private_ipv4(ipv4);
+
+    uint16_t words[8];
+    if (!parse_ipv6(host, words)) return 0;
+    unsigned char ipv6[16];
+    for (size_t i = 0; i < 8; i++) {
+        ipv6[i * 2] = (unsigned char)(words[i] >> 8);
+        ipv6[i * 2 + 1] = (unsigned char)words[i];
+    }
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(ipv6); i++) all_zero &= ipv6[i] == 0;
+    if (all_zero) return 1; /* 未指定地址。 */
+    if (ipv6[0] == 0xff) return 1; /* 组播地址。 */
+    if ((ipv6[0] & 0xfeU) == 0xfcU) return 1; /* 唯一本地地址。 */
+    if (ipv6[0] == 0xfeU && (ipv6[1] & 0xc0U) == 0x80U) return 1; /* 链路本地地址。 */
+    if (ipv6[0] == 0xfeU && (ipv6[1] & 0xc0U) == 0xc0U) return 1; /* 已废弃的站点本地地址。 */
+
+    int prefix_zero = 1;
+    for (size_t i = 0; i < 10; i++) prefix_zero &= ipv6[i] == 0;
+    if (prefix_zero && ipv6[10] == 0xffU && ipv6[11] == 0xffU)
+        return is_private_ipv4(ipv6 + 12);
+    if (prefix_zero && ipv6[10] == 0 && ipv6[11] == 0)
+        return is_private_ipv4(ipv6 + 12); /* 旧式 IPv4 兼容地址沿尾部 IPv4 分类。 */
     return 0;
 }
 
+/**
+ * @brief 在连接层对已取得的数值地址执行当前私网开关检查。
+ * @param[in] policy 可选稳定策略，NULL 为拒绝，size 当前未用于版本分支。
+ * @param[in] host 保留的主机身份借用，当前实现不读取该参数且不重复匹配 allowlist。
+ * @param[in] numeric_address 可选稳定数值地址文本，空值为拒绝。
+ * @return allow_private_networks 非零直接允许非空地址，否则拒绝已识别私网及固定 IPv6 前缀。
+ * @note 调用者先完成 URL allowlist 校验并提供真实连接地址，此入口不执行 DNS 或完整地址有效性认证。
+ */
 int cc_network_policy_address_allowed(
     const cc_network_policy_t *policy,
     const char *host,
@@ -219,10 +355,11 @@ int cc_network_policy_address_allowed(
     return 1;
 }
 
-/*
- * 判断 allowlist entry 是否匹配 URL。
- *
- * entry 指定 scheme/port 时必须完全匹配；未指定时只按 host 模式匹配。
+/**
+ * @brief 将已解析 allowlist 的可选 scheme/port 和 host 模式与 URL 比较。
+ * @param[in] entry 必填稳定解析条目，空 scheme 和负端口为通配。
+ * @param[in] url 必填稳定解析 URL，未显式指定的端口为 -1。
+ * @return 全部已指定字段匹配为一，其他为零，未归一化默认端口。
  */
 static int entry_matches(const url_parts_t *entry, const url_parts_t *url)
 {
@@ -231,14 +368,15 @@ static int entry_matches(const url_parts_t *entry, const url_parts_t *url)
     return host_matches_pattern(url->host, entry->host);
 }
 
-/*
- * 检查 allowlist 是否显式允许该 URL。
- *
- * 该函数同时用于普通 allow 和 private network 例外；只有匹配到有效条目才返回 1。
+/**
+ * @brief 顺序扫描 allowlist 并接受首个可解析且匹配的条目。
+ * @param[in] allowlist 可选稳定列表，非零 count 必须有覆盖 count 项的数组。
+ * @param[in] url 必填稳定解析 URL。
+ * @return 命中为一，空列表、缺数组或全部无效/不匹配为零，NULL 项按无效条目跳过。
  */
 static int explicit_private_allow(const cc_config_string_list_t *allowlist, const url_parts_t *url)
 {
-    if (!allowlist) return 0;
+    if (!allowlist || (allowlist->count && !allowlist->items)) return 0;
     for (size_t i = 0; i < allowlist->count; i++) {
         url_parts_t entry;
         if (!parse_allow_entry(allowlist->items[i], &entry)) continue;
@@ -247,11 +385,12 @@ static int explicit_private_allow(const cc_config_string_list_t *allowlist, cons
     return 0;
 }
 
-/*
- * 判断 URL 是否满足网络策略。
- *
- * 默认拒绝无 policy、非法 URL、非 http/https、userinfo 和私有网络。即便 allow_private_networks
- * 为真，URL 仍需命中 allowlist；这样保持“未显式允许即拒绝”的 SDK 安全默认值。
+/**
+ * @brief 检查 HTTP(S) URL 的端点结构和显式 allowlist 匹配。
+ * @param[in] policy 可选稳定策略及列表借用，NULL 为拒绝，读取期间 owner 排除配置修改。
+ * @param[in] url 可选稳定 URL 文本，userinfo、非 HTTP(S)、空 authority 或容量超限为拒绝。
+ * @return 命中有效 allowlist 为一，其他为零，当前显式 allowlist 可提供私网例外。
+ * @note allow_private_networks 不跳过 allowlist，域名 DNS 解析和重定向后校验由传输调用者负责。
  */
 int cc_network_policy_url_allowed(
     const cc_network_policy_t *policy,
@@ -272,11 +411,11 @@ int cc_network_policy_url_allowed(
     return explicit_private_allow(&policy->allowlist, &parsed);
 }
 
-/*
- * 基于简单 allowlist 的兼容入口。
- *
- * 构造默认 policy 后复用主校验逻辑，确保所有调用路径对 private network、scheme、userinfo
- * 的处理一致。
+/**
+ * @brief 构造禁止默认私网的临时策略并复用 URL allowlist 判断。
+ * @param[in] allowlist 可选稳定列表，结构按值复制而数组与字符串仅在调用期间借用。
+ * @param[in] url 可选稳定 URL 文本。
+ * @return cc_network_policy_url_allowed 的布尔结果，空列表不会命中。
  */
 int cc_network_allowlist_url_allowed(
     const cc_config_string_list_t *allowlist,

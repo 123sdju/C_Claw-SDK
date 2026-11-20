@@ -1,16 +1,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
-/* 读取源码文件并确认业务路径没有退回旧事件名或底层 event bus 直发。 */
+/**
+ * @brief 完整读取源码并检查禁用文本，任何读取失败都使静态回归失败。
+ * @param[in] path 当前工作目录可解析的非 NULL 文件路径借用。
+ * @param[in] needle 非 NULL 禁用子串借用。
+ * @return 命中或打开/定位/大小/分配/读取/关闭失败为一，完整未命中为零。
+ * @note 临时正文由本函数释放，FILE 在返回前消费，输入文件由 CTest 独占稳定读取。
+ */
 static int file_contains(const char *path, const char *needle)
 {
     FILE *fp = fopen(path, "rb");
     if (!fp) return 1;
-    fseek(fp, 0, SEEK_END);
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return 1; }
     long len = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (len < 0) {
+    if (len < 0 || (uintmax_t)len >= (uintmax_t)SIZE_MAX || fseek(fp, 0, SEEK_SET) != 0) {
         fclose(fp);
         return 1;
     }
@@ -20,23 +26,24 @@ static int file_contains(const char *path, const char *needle)
         return 1;
     }
     size_t n = fread(buf, 1, (size_t)len, fp);
-    fclose(fp);
+    int read_failed = n != (size_t)len || ferror(fp);
+    int close_failed = fclose(fp) != 0;
     buf[n] = '\0';
-    int found = strstr(buf, needle) != NULL;
+    int found = read_failed || close_failed || strstr(buf, needle) != NULL;
     free(buf);
     return found;
 }
 
-/*
- * 静态回归测试：禁止 runtime/tool executor 重新引入旧事件名或直接发布 event bus。
- *
- * 这不是通用源码扫描器，只检查 observability 迁移中最关键的业务路径文件。
+/**
+ * @brief 对 runtime 和 executor 两个生产文件逐项检查禁用事件名及直接发布入口。
+ * @return 全部可完整读取且不含七类禁用文本为零，其他为一，无保留资源。
+ * @note CTest 从 SDK 根目录运行，本测试按文本匹配，业务运行事件另由动态测试覆盖。
  */
 int main(void)
 {
     const char *files[] = {
-        "cclaw/core/src/app/cc_agent_runtime.c",
-        "cclaw/core/src/app/cc_tool_executor.c"
+        "core/src/app/cc_agent_runtime.c",
+        "core/src/app/cc_tool_executor.c"
     };
     const char *forbidden[] = {
         "cc_event_bus_publish(",

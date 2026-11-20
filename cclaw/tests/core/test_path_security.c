@@ -6,11 +6,10 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/*
- * 验证 workspace 路径边界检查。
- *
- * 覆盖 `../` 穿越、workspace prefix 绕过和 symlink 指向 workspace 外的 parent 归一化，
- * 这些都是文件写入工具必须防住的场景。
+/**
+ * @brief 在真实独占临时目录验证穿越、相似前缀和符号链接父路径的工作区边界。
+ * @return 全部路径拒绝且夹具清理成功为零，准备、分配、边界或清理失败为一。
+ * @note 目录与链接创建必须成功才进入断言，拥有路径逐项 free，串行清理链接后删除目录。
  */
 int main(void)
 {
@@ -20,31 +19,32 @@ int main(void)
     char outside[320];
     snprintf(ws, sizeof(ws), "%s/ws", base);
     snprintf(outside, sizeof(outside), "%s/outside", base);
-    mkdir(base, 0700);
-    mkdir(ws, 0700);
-    mkdir(outside, 0700);
+    if (mkdir(base, 0700) != 0) return 1;
+    if (mkdir(ws, 0700) != 0) { rmdir(base); return 1; }
+    if (mkdir(outside, 0700) != 0) { rmdir(ws); rmdir(base); return 1; }
 
     int failed = 0;
     char *traversal = cc_path_join(ws, "../outside/new.txt");
-    if (cc_path_is_within(ws, traversal)) failed = 1;
+    if (!traversal || cc_path_is_within(ws, traversal)) failed = 1;
     free(traversal);
 
     char *prefix = cc_path_join(ws, "../ws2/file.txt");
-    if (cc_path_is_within(ws, prefix)) failed = 1;
+    if (!prefix || cc_path_is_within(ws, prefix)) failed = 1;
     free(prefix);
 
     char link_path[360];
     snprintf(link_path, sizeof(link_path), "%s/link", ws);
-    symlink(outside, link_path);
+    int linked = symlink(outside, link_path) == 0;
+    if (!linked) failed = 1;
     char *via_link = cc_path_join(link_path, "new.txt");
-    char *parent = cc_path_dirname(via_link);
-    if (cc_path_is_within(ws, parent)) failed = 1;
+    char *parent = via_link ? cc_path_dirname(via_link) : NULL;
+    if (!via_link || !parent || cc_path_is_within(ws, parent)) failed = 1;
     free(parent);
     free(via_link);
 
-    unlink(link_path);
-    rmdir(outside);
-    rmdir(ws);
-    rmdir(base);
+    if (linked && unlink(link_path) != 0) failed = 1;
+    if (rmdir(outside) != 0) failed = 1;
+    if (rmdir(ws) != 0) failed = 1;
+    if (rmdir(base) != 0) failed = 1;
     return failed ? 1 : 0;
 }

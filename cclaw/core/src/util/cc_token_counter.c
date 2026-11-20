@@ -3,19 +3,21 @@
 
 
 #include "cc/util/cc_token_counter.h"
-#include <string.h>
+#include <limits.h>
+#include <stddef.h>
 
-/*
- * 粗略估算 token 数。
- *
- * ASCII 文本按约 4 字符 1 token 估算，非 ASCII UTF-8 codepoint 近似按 1 token 计。这个
- * 方法不追求模型级精度，而是提供低成本、无词表的上下文窗口保护，适合 MCU/RTOS 裁剪。
+/**
+ * @brief 无分配扫描文本，按四个 ASCII 字节或一个非 ASCII 序列估计一个 token。
+ * @param[in] text 可选稳定借用的 NUL 结尾文本，NULL 返回零。
+ * @return 非负估计，超过 int 表示范围时饱和到 INT_MAX，空串为零。
+ * @note ASCII 连续段分别向上取整，UTF-8 依据首字节跳过后续字节但不验证合法性。
+ * 估计可与模型实际分词不同，调用方按 provider 用量解释精确计量。
  */
 int cc_token_estimate(const char *text)
 {
     if (!text) return 0;
 
-    int tokens = 0;
+    size_t tokens = 0;
     int ascii_run = 0;
 
     for (const char *p = text; *p; p++) {
@@ -62,15 +64,14 @@ int cc_token_estimate(const char *text)
         tokens += (ascii_run + 3) / 4;
     }
 
-    return tokens;
+    return tokens > (size_t)INT_MAX ? INT_MAX : (int)tokens;
 }
 
 
-/*
- * 估算 messages JSON token 数。
- *
- * 当前直接复用文本估算；保留单独入口是为了未来可以针对 message JSON 结构加入更准确
- * 的角色/content/tool_calls 权重，而不修改调用方。
+/**
+ * @brief 将消息 JSON 正文按普通文本估算，保留独立调用入口。
+ * @param[in] messages_text 可选稳定借用的 NUL 结尾正文，未执行 JSON 解析或角色加权。
+ * @return cc_token_estimate 的饱和非负估计，NULL 和空串为零。
  */
 int cc_token_estimate_json_messages(const char *messages_text)
 {

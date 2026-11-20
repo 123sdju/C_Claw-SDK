@@ -1,11 +1,13 @@
 #include <cc/cclaw.h>
 
-/*
- * 最小外部 consumer 入口。
- *
- * 这个文件不是 example，而是 packaging 测试 fixture：安装后的独立 CMake 工程
- * 只通过 <cc/cclaw.h> 使用 SDK，并链接 CClaw::runtime。能调用版本函数说明
- * public include 路径、导出目标和基础符号都已正确安装。
+#if !defined(__cplusplus) && (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L)
+#error "CClaw C consumers require C11 or newer"
+#endif
+
+/**
+ * @brief 通过安装后的公共聚合头及导出 CMake 目标调用版本符号。
+ * @return 获得常驻版本字符串借用时零，NULL 时一，无动态资源。
+ * @note 独立 consumer 工程链接 CClaw::runtime，验证安装头路径、导出依赖及基础符号。
  */
 int main(void)
 {

@@ -9,9 +9,14 @@ set(C_CLAW_ADAPTER_SOURCES
 )
 
 if(CC_ENABLE_SESSION_STORE_JSON_FILE)
+    list(APPEND C_CLAW_ADAPTER_SOURCES src/storage/cc_json_file_store.c)
+endif()
+
+if(CC_ENABLE_SESSION_STORE_JSON_SEGMENTED)
     list(APPEND C_CLAW_ADAPTER_SOURCES
-        src/storage/cc_json_file_store.c
         src/storage/cc_json_segmented_store.c
+        src/storage/cc_segmented_recovery.c
+        src/storage/cc_recovery_bootstrap.c
     )
 endif()
 
@@ -24,8 +29,8 @@ if(CC_ENABLE_MEMORY)
         src/storage/cc_memory_store_factory.c
         src/storage/cc_inmem_memory_store.c
     )
-    if(CC_ENABLE_SESSION_STORE_JSON_FILE)
-        list(APPEND C_CLAW_ADAPTER_SOURCES src/storage/cc_json_file_memory_store.c)
+    if(CC_ENABLE_MEMORY_STORE_JSON_FILE)
+        list(APPEND C_CLAW_ADAPTER_SOURCES src/storage/cc_json_file_memory_store.c src/storage/cc_managed_memory_worker.c src/storage/cc_managed_memory_editor.c)
     endif()
 endif()
 
@@ -89,3 +94,8 @@ target_link_libraries(c_claw_adapters_objects PRIVATE
     c_claw_ports_headers
     c_claw_project_options
 )
+#[[
+  @file 按已解析 feature 组装适配器对象和公共头接口，供父级 runtime 收集。
+  SQLite 原生实现仅随 session SQLite 开关编入，JSON memory 同时受 memory 总开关约束。
+  本目录消费父级选项，目标由构建树持有，源文件及 vendor 内容保持各自所有权。
+]]

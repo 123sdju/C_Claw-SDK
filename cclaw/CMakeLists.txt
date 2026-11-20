@@ -8,11 +8,9 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     project(c_claw VERSION 0.1.0 LANGUAGES C)
 endif()
 
-if(ESP_PLATFORM)
-    set(CMAKE_C_STANDARD 23)
-else()
-    set(CMAKE_C_STANDARD 99)
-endif()
+# SDK 所有平台以 C11 为开发基线，GNU 扩展沿调用者/工具链设置。
+# 变量只作用于本目录及子目录，产品应用目标在外层独立选择标准。
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers")
 
@@ -35,17 +33,25 @@ set_property(CACHE CC_PROFILE PROPERTY STRINGS
     mcu-mm-lite
     esp32-tools)
 
-if(NOT DEFINED CCLAW_PROFILE_FILE OR CCLAW_PROFILE_FILE STREQUAL "")
-    set(CCLAW_PROFILE_FILE "${CMAKE_CURRENT_LIST_DIR}/profiles/${CC_PROFILE}.cmake")
+if(CCLAW_PROFILE_FILE)
+    set(CC_PROFILE_FILE "${CCLAW_PROFILE_FILE}")
+else()
+    set(CC_PROFILE_FILE "${CMAKE_CURRENT_LIST_DIR}/profiles/${CC_PROFILE}.cmake")
 endif()
-set(CCLAW_PROFILE_FILE "${CCLAW_PROFILE_FILE}" CACHE FILEPATH
-    "CClaw profile file; products may provide an external profile")
-if(NOT EXISTS "${CCLAW_PROFILE_FILE}")
-    message(FATAL_ERROR "CClaw profile file does not exist: ${CCLAW_PROFILE_FILE}")
+if(NOT EXISTS "${CC_PROFILE_FILE}")
+    message(FATAL_ERROR "Unknown CC_PROFILE: ${CC_PROFILE}")
 endif()
 
-include("${CCLAW_PROFILE_FILE}")
+include("${CC_PROFILE_FILE}")
 
+#[[
+  @brief 为当前 profile 中尚未定义的变量补入缺省值。
+  @param[in] var 调用者作用域中的变量名，已有普通变量或缓存变量均保留其值。
+  @param[in] value 变量未定义时写入的字符串，可为空或包含 CMake 列表。
+  @return 无显式返回值，新增值通过 PARENT_SCOPE 交给调用者。
+  @note 仅在配置阶段调用，变量副本随调用者作用域存活，函数不创建目标或文件。
+  @warning var 必须是有效的 CMake 变量名，参数语法错误由 CMake 终止配置。
+]]
 function(cc_profile_default var value)
     if(NOT DEFINED ${var})
         set(${var} "${value}" PARENT_SCOPE)
@@ -64,6 +70,10 @@ cc_profile_default(CC_PROFILE_ENABLE_STREAMING ON)
 cc_profile_default(CC_PROFILE_ENABLE_ASYNC_OBSERVABILITY OFF)
 cc_profile_default(CC_PROFILE_ENABLE_SESSION_STORE_MEMORY ON)
 cc_profile_default(CC_PROFILE_ENABLE_SESSION_STORE_JSON_FILE ON)
+cc_profile_default(CC_PROFILE_ENABLE_SESSION_STORE_JSON_SEGMENTED "${CC_PROFILE_ENABLE_SESSION_STORE_JSON_FILE}")
+cc_profile_default(CC_PROFILE_ENABLE_MEMORY_STORE_JSON_FILE "${CC_PROFILE_ENABLE_SESSION_STORE_JSON_FILE}")
+cc_profile_default(CC_PROFILE_JSON_MEMORY_MAX_FILE_BYTES 0)
+cc_profile_default(CC_PROFILE_CONTEXT_MEDIA_MAX_BYTES 0)
 cc_profile_default(CC_PROFILE_ENABLE_SESSION_STORE_SQLITE "${CC_PROFILE_ENABLE_SQLITE}")
 
 
@@ -71,7 +81,7 @@ set(CC_TARGET_PLATFORM "${CC_PROFILE_TARGET_PLATFORM}" CACHE STRING "Target plat
 set_property(CACHE CC_TARGET_PLATFORM PROPERTY STRINGS auto posix windows esp32 freertos)
 
 if(CC_TARGET_PLATFORM STREQUAL "auto")
-    if(DEFINED ESP_PLATFORM)
+    if(ESP_PLATFORM)
         set(CC_TARGET_PLATFORM_RESOLVED "esp32")
     elseif(WIN32)
         set(CC_TARGET_PLATFORM_RESOLVED "windows")
@@ -143,6 +153,15 @@ option(CC_ENABLE_STREAMING "Enable streaming response/event code paths" ${CC_PRO
 option(CC_ENABLE_ASYNC_OBSERVABILITY "Enable async SDK observability event bus by default" ${CC_PROFILE_ENABLE_ASYNC_OBSERVABILITY})
 option(CC_ENABLE_SESSION_STORE_MEMORY "Enable in-memory session store" ${CC_PROFILE_ENABLE_SESSION_STORE_MEMORY})
 option(CC_ENABLE_SESSION_STORE_JSON_FILE "Enable JSON-file session store" ${CC_PROFILE_ENABLE_SESSION_STORE_JSON_FILE})
+option(CC_ENABLE_SESSION_STORE_JSON_SEGMENTED "Enable segmented JSON session store" ${CC_PROFILE_ENABLE_SESSION_STORE_JSON_SEGMENTED})
+option(CC_ENABLE_MEMORY_STORE_JSON_FILE "Enable JSON-file memory store" ${CC_PROFILE_ENABLE_MEMORY_STORE_JSON_FILE})
+set(CC_JSON_MEMORY_MAX_FILE_BYTES "${CC_PROFILE_JSON_MEMORY_MAX_FILE_BYTES}" CACHE STRING "Maximum JSON memory file bytes, 0 for unlimited")
+set(CC_CONTEXT_MEDIA_MAX_BYTES "${CC_PROFILE_CONTEXT_MEDIA_MAX_BYTES}" CACHE STRING "Maximum inline media bytes per context, 0 for unlimited")
+foreach(budget CC_JSON_MEMORY_MAX_FILE_BYTES CC_CONTEXT_MEDIA_MAX_BYTES)
+    if(NOT "${${budget}}" MATCHES "^[0-9]+$")
+        message(FATAL_ERROR "${budget} must be a nonnegative integer")
+    endif()
+endforeach()
 option(CC_ENABLE_SESSION_STORE_SQLITE "Enable SQLite session store" ${CC_PROFILE_ENABLE_SESSION_STORE_SQLITE})
 option(CC_ENABLE_OPENAI "Enable OpenAI-compatible LLM adapter" ${CC_PROFILE_ENABLE_OPENAI})
 option(CC_ENABLE_OLLAMA "Enable Ollama LLM adapter" ${CC_PROFILE_ENABLE_OLLAMA})
@@ -211,6 +230,10 @@ if(CC_PROFILE STREQUAL "esp32-tools" OR CCLAW_PROFILE_LOCK_OPTIONS)
         CACHE BOOL "Enable in-memory session store" FORCE)
     set(CC_ENABLE_SESSION_STORE_JSON_FILE ${CC_PROFILE_ENABLE_SESSION_STORE_JSON_FILE}
         CACHE BOOL "Enable JSON-file session store" FORCE)
+    set(CC_ENABLE_SESSION_STORE_JSON_SEGMENTED ${CC_PROFILE_ENABLE_SESSION_STORE_JSON_SEGMENTED}
+        CACHE BOOL "Enable segmented JSON session store" FORCE)
+    set(CC_ENABLE_MEMORY_STORE_JSON_FILE ${CC_PROFILE_ENABLE_MEMORY_STORE_JSON_FILE}
+        CACHE BOOL "Enable JSON-file memory store" FORCE)
     set(CC_ENABLE_SESSION_STORE_SQLITE ${CC_PROFILE_ENABLE_SESSION_STORE_SQLITE}
         CACHE BOOL "Enable SQLite session store" FORCE)
     set(CC_ENABLE_STREAMING ${CC_PROFILE_ENABLE_STREAMING}
@@ -221,9 +244,7 @@ endif()
 
 option(CC_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
-# Feature dependencies are contracts, not best-effort runtime fallbacks.  Reject
-# impossible combinations while configuring so platform profiles cannot silently
-# compile code whose owner subsystem is absent.
+# 配置阶段校验功能依赖，避免编入依赖缺失的子系统。
 if((CC_ENABLE_MCP_STDIO OR CC_ENABLE_MCP_HTTP) AND NOT CC_ENABLE_MCP)
     message(FATAL_ERROR "MCP transports require CC_ENABLE_MCP=ON")
 endif()
@@ -261,6 +282,12 @@ endif()
 set(CC_NEEDS_HTTP_CLIENT OFF)
 if(CC_ENABLE_HTTP_TOOL OR CC_ENABLE_OPENAI OR CC_ENABLE_OLLAMA OR CC_ENABLE_ANTHROPIC OR CC_ENABLE_MCP_HTTP)
     set(CC_NEEDS_HTTP_CLIENT ON)
+endif()
+
+# 在共同父目录查找 CURL imported target，使平台子目录和 runtime 均可引用。
+if(CC_NEEDS_HTTP_CLIENT AND
+   (CC_TARGET_PLATFORM_RESOLVED STREQUAL "posix" OR CC_TARGET_PLATFORM_RESOLVED STREQUAL "windows"))
+    find_package(CURL QUIET)
 endif()
 
 if(CC_TARGET_PLATFORM_RESOLVED STREQUAL "windows" AND CC_ENABLE_DOCKER_SANDBOX)
@@ -313,8 +340,11 @@ endif()
 
 
 add_library(c_claw_project_options INTERFACE)
+# 通过导出目标声明 C 调用方的最低要求，调用方仍可采用更新的 C 标准。
+target_compile_features(c_claw_project_options INTERFACE c_std_11)
 target_compile_definitions(c_claw_project_options INTERFACE
     CC_PLATFORM=${CC_PLATFORM_ID}
+    CC_HAS_HTTP_CLIENT=$<BOOL:${CC_NEEDS_HTTP_CLIENT}>
     CC_TOOL_SHELL_RUN=$<BOOL:${CC_ENABLE_SHELL}>
     CC_SANDBOX_LOCAL=$<BOOL:${CC_ENABLE_SHELL}>
     CC_SANDBOX_DOCKER=$<BOOL:${CC_ENABLE_DOCKER_SANDBOX}>
@@ -346,6 +376,10 @@ target_compile_definitions(c_claw_project_options INTERFACE
     CC_ENABLE_ASYNC_OBSERVABILITY=$<BOOL:${CC_ENABLE_ASYNC_OBSERVABILITY}>
     CC_STORAGE_SQLITE=$<BOOL:${CC_ENABLE_SESSION_STORE_SQLITE}>
     CC_STORAGE_JSON_FILE=$<BOOL:${CC_ENABLE_SESSION_STORE_JSON_FILE}>
+    CC_STORAGE_JSON_SEGMENTED=$<BOOL:${CC_ENABLE_SESSION_STORE_JSON_SEGMENTED}>
+    CC_MEMORY_STORE_JSON_FILE=$<BOOL:${CC_ENABLE_MEMORY_STORE_JSON_FILE}>
+    CC_JSON_MEMORY_MAX_FILE_BYTES=${CC_JSON_MEMORY_MAX_FILE_BYTES}
+    CC_CONTEXT_MEDIA_MAX_BYTES=${CC_CONTEXT_MEDIA_MAX_BYTES}
     CC_STORAGE_MEMORY=$<BOOL:${CC_ENABLE_SESSION_STORE_MEMORY}>
     CC_LLM_OPENAI=$<BOOL:${CC_ENABLE_OPENAI}>
     CC_LLM_OLLAMA=$<BOOL:${CC_ENABLE_OLLAMA}>
@@ -425,7 +459,9 @@ target_link_libraries(c_claw_runtime PUBLIC
     c_claw_project_options
 )
 
+set(CC_PACKAGE_REQUIRES_THREADS OFF)
 if(NOT CC_TARGET_PLATFORM_RESOLVED STREQUAL "esp32" AND NOT CC_TARGET_PLATFORM_RESOLVED STREQUAL "freertos")
+    set(CC_PACKAGE_REQUIRES_THREADS ON)
     target_link_libraries(c_claw_runtime PUBLIC Threads::Threads)
     if(CMAKE_DL_LIBS)
         target_link_libraries(c_claw_runtime PUBLIC ${CMAKE_DL_LIBS})
@@ -434,6 +470,10 @@ endif()
 
 if(CC_PLATFORM_PUBLIC_LIBRARIES)
     target_link_libraries(c_claw_runtime PUBLIC ${CC_PLATFORM_PUBLIC_LIBRARIES})
+endif()
+set(CC_PACKAGE_REQUIRES_CURL OFF)
+if("CURL::libcurl" IN_LIST CC_PLATFORM_PUBLIC_LIBRARIES)
+    set(CC_PACKAGE_REQUIRES_CURL ON)
 endif()
 if(CC_PLATFORM_PUBLIC_INCLUDE_DIRS)
     target_include_directories(c_claw_runtime PRIVATE ${CC_PLATFORM_PUBLIC_INCLUDE_DIRS})
@@ -485,6 +525,42 @@ if(NOT ESP_PLATFORM)
         DESTINATION "${CCLAW_CMAKE_INSTALL_DIR}"
     )
 
+    # pcfiledir 随安装位置变化，按真实 libdir 计算回到 prefix 的相对路径。
+    # 绝对安装目录按 GNUInstallDirs 语义保留，常规相对目录随 prefix 迁移。
+    file(RELATIVE_PATH CCLAW_PC_PREFIX_RELATIVE
+        "${CMAKE_INSTALL_FULL_LIBDIR}/pkgconfig" "${CMAKE_INSTALL_PREFIX}")
+    set(CCLAW_PC_LIBDIR "${CMAKE_INSTALL_LIBDIR}")
+    if(NOT IS_ABSOLUTE "${CCLAW_PC_LIBDIR}")
+        set(CCLAW_PC_LIBDIR "\${prefix}/${CCLAW_PC_LIBDIR}")
+    endif()
+    set(CCLAW_PC_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}")
+    if(NOT IS_ABSOLUTE "${CCLAW_PC_INCLUDEDIR}")
+        set(CCLAW_PC_INCLUDEDIR "\${prefix}/${CCLAW_PC_INCLUDEDIR}")
+    endif()
+    set(CCLAW_PC_REQUIRES_PRIVATE "")
+    set(CCLAW_PC_LIBS_PRIVATE "")
+    if(CC_PACKAGE_REQUIRES_THREADS)
+        set(CCLAW_PC_LIBS_PRIVATE "${CMAKE_THREAD_LIBS_INIT}")
+    endif()
+    if(CC_ENABLE_SANITIZERS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        string(APPEND CCLAW_PC_LIBS_PRIVATE " -fsanitize=address,undefined")
+    endif()
+    set(CCLAW_PC_LINK_LIBRARIES ${CC_PLATFORM_PUBLIC_LIBRARIES})
+    if(CC_PACKAGE_REQUIRES_THREADS)
+        list(APPEND CCLAW_PC_LINK_LIBRARIES ${CMAKE_DL_LIBS})
+    endif()
+    foreach(library IN LISTS CCLAW_PC_LINK_LIBRARIES)
+        if(library STREQUAL "CURL::libcurl")
+            set(CCLAW_PC_REQUIRES_PRIVATE "libcurl")
+        elseif(IS_ABSOLUTE "${library}")
+            string(APPEND CCLAW_PC_LIBS_PRIVATE " \"${library}\"")
+        elseif(library MATCHES "^-")
+            string(APPEND CCLAW_PC_LIBS_PRIVATE " ${library}")
+        else()
+            string(APPEND CCLAW_PC_LIBS_PRIVATE " -l${library}")
+        endif()
+    endforeach()
+    string(STRIP "${CCLAW_PC_LIBS_PRIVATE}" CCLAW_PC_LIBS_PRIVATE)
     configure_file(
         "${CMAKE_CURRENT_LIST_DIR}/../cmake/cclaw.pc.in"
         "${CMAKE_CURRENT_BINARY_DIR}/cclaw.pc"

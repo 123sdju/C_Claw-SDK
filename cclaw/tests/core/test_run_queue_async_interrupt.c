@@ -10,11 +10,12 @@ typedef struct interrupt_state {
     int started;
 } interrupt_state_t;
 
-/*
- * 可取消任务。
- *
- * 任务启动后循环检查 cancel token；收到中断后返回 CC_ERR_CANCELLED，验证取消能传播到
- * 正在运行的 job。
+/**
+ * @brief 发布已启动条件后轮询取消令牌并返回取消结果。
+ * @param[in,out] user_data interrupt_state_t 借用，mutex/cond 覆盖作业与 collect 期。
+ * @param[in] token 队列拥有的取消令牌借用，只在任务执行期间查询。
+ * @return 拥有取消诊断的结果，交队列保存并由 collect 调用者消费。
+ * @note started 在状态锁内写并广播，主线程观察启动后发起取消，任务无额外拥有资源。
  */
 static cc_result_t cancellable_task(void *user_data, cc_cancel_token_t *token)
 {
@@ -31,10 +32,22 @@ static cc_result_t cancellable_task(void *user_data, cc_cancel_token_t *token)
     return cc_result_error(CC_ERR_CANCELLED, "Task observed cancellation");
 }
 
-/*
- * 验证异步提交后按 run_id interrupt。
- *
- * collect 应收到 CC_ERR_CANCELLED，并且 queue 的 in_flight/pending 计数归零。
+/**
+ * @brief 检查成功并消费临时操作结果。
+ * @param[in] result 按值移交的拥有结果。
+ * @return CC_OK 时一，否则零。
+ */
+static int succeeded(cc_result_t result)
+{
+    int good = result.code == CC_OK;
+    cc_result_free(&result);
+    return good;
+}
+
+/**
+ * @brief 等待任务真正启动后按 run_id 取消，再 collect 并核对队列计数归零。
+ * @return 全部创建、取消及终态断言通过零，否则一，正常路径排空队列后释放条件和锁。
+ * @note 栈上下文覆盖整个作业，启动条件由 mutex/cond 同步，令牌由队列持有。
  */
 int main(void)
 {
@@ -47,11 +60,13 @@ int main(void)
     state.cond = NULL;
     state.started = 0;
 
-    if (cc_mutex_create(&state.mutex).code != CC_OK) return 1;
-    if (cc_cond_create(&state.cond).code != CC_OK) return 1;
+    if (!succeeded(cc_mutex_create(&state.mutex))) return 1;
+    if (!succeeded(cc_cond_create(&state.cond))) { cc_mutex_destroy(state.mutex); return 1; }
 
     cc_run_queue_t *queue = NULL;
-    if (cc_run_queue_create(&config, &queue).code != CC_OK) return 1;
+    if (!succeeded(cc_run_queue_create(&config, &queue))) {
+        cc_cond_destroy(state.cond); cc_mutex_destroy(state.mutex); return 1;
+    }
 
     cc_run_queue_request_t request;
     request.session_key = "agent:session";
@@ -66,7 +81,10 @@ int main(void)
         &state,
         &run_id
     );
-    if (rc.code != CC_OK) return 1;
+    if (rc.code != CC_OK) {
+        cc_result_free(&rc); cc_run_queue_destroy(queue);
+        cc_cond_destroy(state.cond); cc_mutex_destroy(state.mutex); return 1;
+    }
     cc_result_free(&rc);
 
     cc_mutex_lock(state.mutex);
@@ -76,7 +94,10 @@ int main(void)
     cc_mutex_unlock(state.mutex);
 
     rc = cc_run_queue_interrupt_run(queue, run_id);
-    if (rc.code != CC_OK) return 1;
+    if (rc.code != CC_OK) {
+        cc_result_free(&rc); cc_run_queue_destroy(queue);
+        cc_cond_destroy(state.cond); cc_mutex_destroy(state.mutex); return 1;
+    }
     cc_result_free(&rc);
 
     rc = cc_run_queue_collect(queue, run_id);

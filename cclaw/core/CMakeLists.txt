@@ -15,17 +15,23 @@ set(C_CLAW_CORE_SOURCES
     src/core/cc_observability.c
     src/core/cc_memory_entry.c
     src/core/cc_memory_store.c
+    src/core/cc_sandbox.c
     src/core/cc_secret_store.c
     src/core/cc_id.c
     src/util/cc_string_builder.c
     src/util/cc_base64.c
     src/util/cc_json.c
     src/util/cc_config.c
+    src/util/cc_tool_name.c
     src/util/cc_network_policy.c
     src/util/cc_redaction.c
     src/util/cc_token_counter.c
     src/util/cc_logger.c
     src/app/cc_context_builder.c
+    src/app/cc_cache_metrics.c
+    src/app/cc_operation_journal.c
+    src/app/cc_storage_binding.c
+    src/app/cc_run_checkpoint.c
     src/app/cc_tool_executor.c
     src/app/cc_session_manager.c
     src/app/cc_cancel_token.c
@@ -35,6 +41,10 @@ set(C_CLAW_CORE_SOURCES
     src/app/cc_runtime_controller.c
     src/app/cc_runtime_builder.c
     src/app/cc_memory_context.c
+    src/app/cc_memory_extractor.c
+    src/app/cc_memory_plan.c
+    src/app/cc_memory_snapshot.c
+    src/app/cc_memory_pending_queue.c
 )
 
 if(CC_ENABLE_RUN_QUEUE)
@@ -93,3 +103,7 @@ target_link_libraries(c_claw_core PUBLIC
     c_claw_ports_headers
     c_claw_project_options
 )
+#[[
+  @file 构建核心公共头、对象及静态库，按选项加入队列、工作池、skills、MCP 与多 agent。
+  核心目标消费父级 project_options，目标依赖及对象寿命由 CMake 构建图管理。
+]]

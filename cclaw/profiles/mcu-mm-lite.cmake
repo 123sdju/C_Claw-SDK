@@ -1,3 +1,7 @@
+# 轻量多模态 SDK 预设，保留图像/文件及媒体输出的结构化路径，关闭内联 Base64 和产物库。
+# 会话仅缺省启用内存后端，长期记忆、三 provider、streaming、工具和并发扩展默认关闭。
+# 应用按实际硬件/模型能力提供实现，平台 auto 解析及功能依赖由根构建负责。
+# 配置期赋值供首次 option 缺省，已有 cache 的覆盖需结合根契约检查。
 set(CC_PROFILE_TARGET_PLATFORM auto)
 
 
@@ -37,6 +41,8 @@ set(CC_PROFILE_ENABLE_SESSION_STORE_MEMORY ON)
 set(CC_PROFILE_ENABLE_SESSION_STORE_JSON_FILE OFF)
 set(CC_PROFILE_ENABLE_SESSION_STORE_SQLITE OFF)
 
+# 数据和工作区缺省位于构建目录，空会话/记忆路径由本预设保留。
+# 声明路径只形成编译默认值，实际存储与挂载由调用者组装。
 set(CC_PROFILE_DEFAULT_CONFIG_PATH "")
 set(CC_PROFILE_DEFAULT_DATA_DIR "${CMAKE_BINARY_DIR}/runtime/data")
 set(CC_PROFILE_DEFAULT_WORKSPACE_PATH "${CMAKE_BINARY_DIR}/runtime/workspace")

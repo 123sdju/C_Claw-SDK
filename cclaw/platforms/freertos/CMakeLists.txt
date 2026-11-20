@@ -68,3 +68,8 @@ endif()
 
 set(CC_PLATFORM_PUBLIC_INCLUDE_DIRS "" PARENT_SCOPE)
 set(CC_PLATFORM_PUBLIC_LIBRARIES "" PARENT_SCOPE)
+#[[
+  @file 组装通用 FreeRTOS 平台，使用调用者提供的 kernel、port 和配置头目录。
+  FATFS、LWIP、MBEDTLS 开启时校验相应包含路径，缺失依赖以配置错误终止。
+  本目录创建的对象由构建树持有，内核及网络库的实际链接由集成工程提供。
+]]

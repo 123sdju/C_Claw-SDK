@@ -1,3 +1,8 @@
+# 桌面 Agent SDK 预设，平台 auto 由根结合 ESP-IDF 标志和宿主平台解析。
+# 启用文件/HTTP 工具、记忆、队列/工具池、技能目录、三 provider 和完整媒体路径。
+# 内存/JSON/SQLite 会话可选，active memory 与异步观测默认启用，应用仍负责组装实例。
+# shell、插件进程、MCP 及子代理等默认关闭，预设开关仅在 option 首次建立时提供缺省。
+# 同一构建目录已有 cache 保留其显式选择，非法依赖组合由根在配置期拒绝。
 set(CC_PROFILE_TARGET_PLATFORM auto)
 
 
@@ -5,7 +10,7 @@ set(CC_PROFILE_TARGET_PLATFORM auto)
 set(CC_PROFILE_ENABLE_FILE_TOOLS ON)
 set(CC_PROFILE_ENABLE_HTTP_TOOL ON)
 set(CC_PROFILE_ENABLE_MEMORY ON)
-set(CC_PROFILE_ENABLE_SHELL ON)
+set(CC_PROFILE_ENABLE_SHELL OFF)
 set(CC_PROFILE_ENABLE_PLUGIN OFF)
 set(CC_PROFILE_ENABLE_MULTI_AGENT ON)
 set(CC_PROFILE_ENABLE_RUN_QUEUE ON)
@@ -38,10 +43,11 @@ set(CC_PROFILE_ENABLE_SESSION_STORE_MEMORY ON)
 set(CC_PROFILE_ENABLE_SESSION_STORE_JSON_FILE ON)
 set(CC_PROFILE_ENABLE_SESSION_STORE_SQLITE ON)
 
+# 默认 JSON/数据库和工作区位于构建目录，SQLite 会话路径由根派生为 c-claw.db。
+# memory.db 对应本预设的持久记忆后端，实际装配和文件寿命由应用 owner 管理。
 set(CC_PROFILE_DEFAULT_CONFIG_PATH "")
 set(CC_PROFILE_DEFAULT_DATA_DIR "${CMAKE_BINARY_DIR}/runtime/data")
 set(CC_PROFILE_DEFAULT_WORKSPACE_PATH "${CMAKE_BINARY_DIR}/runtime/workspace")
-set(CC_PROFILE_DEFAULT_STORAGE_PATH "${CMAKE_BINARY_DIR}/runtime/data/c-claw.db")
 set(CC_PROFILE_DEFAULT_MEMORY_PATH "${CMAKE_BINARY_DIR}/runtime/data/memory.db")
 set(CC_PROFILE_DEFAULT_SOUL_FILE "")
 set(CC_PROFILE_DEFAULT_USER_FILE "")

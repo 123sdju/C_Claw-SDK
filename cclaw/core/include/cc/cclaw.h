@@ -2,12 +2,12 @@
 #define CC_CCLAW_H
 
 /*
- * C-Claw SDK 的聚合 public header。
+ * C-Claw SDK 的聚合公共头。
  *
  * 下游应用优先 include <cc/cclaw.h>，而不是依赖 src/ 或 *_internal.h。该头只聚合
  * 核心 SDK 合约：数据模型、runtime、ports、必要 adapters 和 util，不包含 examples、
  * CLI、Web、UART 或业务 gateway。嵌入式项目可以在 profile 层裁剪具体库目标，但
- * public API 边界以这里列出的头文件为准。
+ * 单个模块也可通过各自公共头调用，声明存在与所选功能的符号链接分别由 profile 决定。
  */
 
 /* 版本、错误模型和核心数据结构。 */

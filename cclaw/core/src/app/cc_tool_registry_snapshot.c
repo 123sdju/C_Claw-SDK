@@ -7,25 +7,22 @@
 
 #include <stdlib.h>
 
-/*
- * 工具注册表快照内部状态。
- *
- * generation 标识这批工具集合版本，ref_count 保护 reload 期间旧 run 继续使用旧 registry。
- * owns_registry 决定最后释放快照时是否销毁 registry。
- */
+/** 注册表指针和版本在创建后固定，引用计数锁仅保护引用增减。 */
 struct cc_tool_registry_snapshot {
-    cc_tool_registry_t *registry;
-    unsigned long generation;
-    int owns_registry;
-    size_t ref_count;
-    cc_mutex_t mutex;
+    cc_tool_registry_t *registry; /**< 按 owns_registry 拥有或持续借用的注册表。 */
+    unsigned long generation;    /**< 调用者指定的不可变版本值。 */
+    int owns_registry;           /**< 规范化的一/零拥有标志。 */
+    size_t ref_count;            /**< 受 mutex 保护的有效引用数，创建后为一。 */
+    cc_mutex_t mutex;            /**< 对象拥有的引用计数互斥锁。 */
 };
 
-/*
- * 创建工具注册表快照。
- *
- * 初始引用计数为 1；调用方可以把 snapshot 发布给 runtime 读路径。mutex 创建失败会释放
- * 快照，但不会销毁外部传入的 registry。
+/**
+ * @brief 分配快照、固定注册表身份与版本，并创建保护初始单引用的 mutex。
+ * @param[in,out] registry 必填注册表，成功且 owns_registry 非零时转交拥有，失败保持外层拥有关系。
+ * @param[in] generation 原样保存的版本标识，允许零。
+ * @param[in] owns_registry 非零规范化为一，决定最后 release 是否销毁 registry。
+ * @param[out] out_snapshot 必填，仅成功时填写初始引用，失败保持原值，须无待释放旧引用。
+ * @return 成功为 CC_OK，空参数为 CC_ERR_INVALID_ARGUMENT，分配失败为 CC_ERR_OUT_OF_MEMORY，mutex 创建错误原样返回并释放快照外壳。
  */
 cc_result_t cc_tool_registry_snapshot_create(
     cc_tool_registry_t *registry,
@@ -52,7 +49,12 @@ cc_result_t cc_tool_registry_snapshot_create(
     return cc_result_ok();
 }
 
-/* 增加快照引用计数，保证调用方使用期间 registry 不会被 reload 释放。 */
+/**
+ * @brief 锁内递增 ref_count，交付需要配对释放的新引用。
+ * @pre 外层有效引用或发布锁保证 snapshot 在加锁前已存活，计数加一在 size_t 范围内。
+ * @param[in,out] snapshot 存活的快照，允许 NULL。
+ * @return 返回相同快照地址，NULL 输入返回 NULL，外层协调 acquire 与最后释放之间的发布顺序。
+ */
 cc_tool_registry_snapshot_t *cc_tool_registry_snapshot_acquire(
     cc_tool_registry_snapshot_t *snapshot
 )
@@ -65,11 +67,11 @@ cc_tool_registry_snapshot_t *cc_tool_registry_snapshot_acquire(
     return snapshot;
 }
 
-/*
- * 释放快照引用。
- *
- * 最后一个引用负责可选销毁 registry、销毁 mutex 并释放 snapshot。引用计数操作在锁内
- * 完成，销毁动作在锁外完成，避免销毁 mutex 时仍持锁。
+/**
+ * @brief 锁内归还引用并判断归零，锁外销毁拥有的 registry、mutex 和快照外壳。
+ * @pre 调用者归还一份有效引用，其 registry/工具使用已退出，外层排除无引用访问及重复释放。
+ * @param[in,out] snapshot 待消费的引用，允许 NULL。
+ * @post 本次引用消费完毕；归零时借用指针失效，注册表销毁可能调用工具 destroy，执行时已释放计数锁。
  */
 void cc_tool_registry_snapshot_release(cc_tool_registry_snapshot_t *snapshot)
 {
@@ -88,7 +90,11 @@ void cc_tool_registry_snapshot_release(cc_tool_registry_snapshot_t *snapshot)
     free(snapshot);
 }
 
-/* 返回快照中的 registry 借用指针。 */
+/**
+ * @brief 直接读取创建后固定的 registry 指针。
+ * @param[in] snapshot 调用者持有有效引用的快照，允许 NULL。
+ * @return registry 借用指针，须在当前引用归还前结束使用，NULL 输入返回 NULL。
+ */
 cc_tool_registry_t *cc_tool_registry_snapshot_registry(
     cc_tool_registry_snapshot_t *snapshot
 )
@@ -96,7 +102,11 @@ cc_tool_registry_t *cc_tool_registry_snapshot_registry(
     return snapshot ? snapshot->registry : NULL;
 }
 
-/* 返回快照 generation，用于日志和 reload 一致性检查。 */
+/**
+ * @brief 直接读取创建后固定的 generation 值。
+ * @param[in] snapshot 调用者持有有效引用的快照，允许 NULL。
+ * @return 保存的版本值，NULL 输入返回零，查询无需修改快照状态。
+ */
 unsigned long cc_tool_registry_snapshot_generation(
     cc_tool_registry_snapshot_t *snapshot
 )

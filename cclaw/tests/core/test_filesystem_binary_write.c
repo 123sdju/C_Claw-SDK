@@ -3,6 +3,11 @@
 #include <stdio.h>
 #include <string.h>
 
+/**
+ * @brief 经真实默认文件端口写入含 NUL 的二进制正文并用 FILE 核对完整字节及 EOF。
+ * @return 成功零，端口创建、能力、写入、打开或内容/清理失败分别返回一至五。
+ * @note 当前进程独占工作文件，端口拥有实例在成功和已处理 I/O 失败路径销毁，诊断逐次消费。
+ */
 int main(void)
 {
     static const unsigned char payload[] = {

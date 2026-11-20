@@ -8,6 +8,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/**
+ * @brief 检查引用前缀并借出其非空正文。
+ * @param[in] reference 借用的 NUL 结尾引用，可为 NULL。
+ * @param[in] scheme 必填的 NUL 结尾前缀，当前调用点传入常量。
+ * @return 匹配时返回 reference 内借用地址，缺失或前缀不匹配返回 NULL。
+ * @note 返回值的寿命随 reference，比较区分大小写。
+ */
 static const char *reference_value(const char *reference, const char *scheme)
 {
     size_t length = strlen(scheme);
@@ -15,6 +22,15 @@ static const char *reference_value(const char *reference, const char *scheme)
     return reference + length;
 }
 
+/**
+ * @brief 复制环境变量或 Windows 通用凭据的正文。
+ * @param[in,out] self 静态后端占位，当前实现忽略。
+ * @param[in] reference 借用的 env:NAME 或 cred:TARGET 引用，正文必须非空。
+ * @param[out] out_secret 必填空槽，成功取得独占的 NUL 结尾分配并最终 cc_secret_free。
+ * @return 成功为 CC_OK，参数、缺失、原生读取或分配失败返回对应拥有结果。
+ * @note 原生凭据对象在返回前 CredFree。凭据 blob 按原始字节复制，strlen 型清除只覆盖首个 NUL 前正文。
+ * 环境变量读取须由调用者协调并发修改，所有拥有诊断由调用者释放。
+ */
 static cc_result_t windows_secret_get(void *self, const char *reference, char **out_secret)
 {
     (void)self;
@@ -52,6 +68,14 @@ static cc_result_t windows_secret_get(void *self, const char *reference, char **
     return cc_result_ok();
 }
 
+/**
+ * @brief 将文本同步写入 Windows 通用凭据并采用本机持久化范围。
+ * @param[in,out] self 静态后端占位，当前实现忽略。
+ * @param[in] reference 调用期间借用的 cred:TARGET 引用。
+ * @param[in] secret 借用的 NUL 结尾文本，长度受原生凭据 blob 上限约束。
+ * @return 成功为 CC_OK，参数、长度或原生失败返回对应拥有结果，调用者释放诊断。
+ * @note 原生调用期间借用输入，不保留地址，同一目标的业务顺序由使用方协调。
+ */
 static cc_result_t windows_secret_set(void *self, const char *reference, const char *secret)
 {
     (void)self;
@@ -78,6 +102,13 @@ static cc_result_t windows_secret_set(void *self, const char *reference, const c
     return cc_result_ok();
 }
 
+/**
+ * @brief 删除 cred:TARGET 对应的 Windows 通用凭据。
+ * @param[in,out] self 静态后端占位，当前实现忽略。
+ * @param[in] reference 调用期间借用的 cred:TARGET 引用。
+ * @return 成功为 CC_OK，目标缺失为 NOT_FOUND，参数或原生失败返回对应拥有结果。
+ * @note 拥有诊断由调用者释放，同一目标的业务顺序由使用方协调。
+ */
 static cc_result_t windows_secret_remove(void *self, const char *reference)
 {
     (void)self;
@@ -93,6 +124,11 @@ static cc_result_t windows_secret_remove(void *self, const char *reference)
     return cc_result_ok();
 }
 
+/**
+ * @brief 结束静态 Windows 凭据后端描述符的使用。
+ * @param[in,out] self 忽略的占位，默认工厂交付 NULL。
+ * @post 静态方法表由模块继续持有，调用者自行丢弃描述符。
+ */
 static void windows_secret_destroy(void *self) { (void)self; }
 
 static const cc_secret_store_vtable_t windows_secret_vtable = {
@@ -106,6 +142,13 @@ static const cc_secret_store_vtable_t windows_secret_vtable = {
     .destroy = windows_secret_destroy,
 };
 
+/**
+ * @brief 构造 Windows 环境查询与凭据管理器后端描述符。
+ * @param[out] out_store 必填空描述符，成功取得静态方法表与能力位，self 为 NULL。
+ * @return 成功为 CC_OK，空输出为 INVALID_ARGUMENT，拥有诊断由调用者释放。
+ * @note SECURE_AT_REST 描述 cred 存储能力，env 引用的内容由进程环境拥有者管理。
+ * 工厂无状态分配，复用输出前须先结束旧描述符生命周期。
+ */
 cc_result_t cc_secret_store_get_default(cc_secret_store_t *out_store)
 {
     if (!out_store) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null secret store output");

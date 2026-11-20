@@ -2,28 +2,32 @@
 
 #include "cc/util/cc_json.h"
 #include "cc/internal/cc_alloc.h"
+#include "cc/internal/cc_json_syntax_check.h"
+#include "cc/internal/cc_json_fields.h"
 #include "cc/util/cc_string_builder.h"
+#include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 
 
 
-/*
- * 安全获取可空字符串长度。
- *
- * media 校验里很多字段可选，统一把 NULL 当作长度 0 可以减少调用点分支。
+/**
+ * @brief 获取可选媒体字符串的字节长度。
+ * @param[in] s 稳定 NUL 文本，可为 NULL。
+ * @return strlen 字节数，NULL 为零。
  */
 static size_t string_len(const char *s)
 {
     return s ? strlen(s) : 0;
 }
 
-/*
- * 判断字符串是否匹配前缀。
- *
- * MIME allowlist 使用前缀而不是完整等值匹配，方便表达 image/、audio/ 这类
- * 协议族；NULL 输入直接失败，避免校验路径里解引用空指针。
+/**
+ * @brief 对 MIME 策略执行区分大小写的前缀比较。
+ * @param[in] s 借用的完整字符串，可为 NULL。
+ * @param[in] prefix 借用前缀，可为 NULL，空串可匹配任意非空指针输入。
+ * @return 两参数均非 NULL 且前缀相同时为 1，否则为 0。
  */
 static int starts_with(const char *s, const char *prefix)
 {
@@ -31,11 +35,10 @@ static int starts_with(const char *s, const char *prefix)
     return s && prefix && strncmp(s, prefix, n) == 0;
 }
 
-/*
- * media kind 到协议字符串的映射。
- *
- * provider adapter、JSON 序列化和日志都复用这里的名字，避免模块间出现 image/
- * img 等不一致拼写。未知值按 file 输出，代表最保守的二进制附件语义。
+/**
+ * @brief 为类型标记选择固定协议名称。
+ * @param[in] kind 媒体或文本标记，未知值沿 FILE 映射。
+ * @return 静态只读字符串，无分配，调用者不得释放。
  */
 const char *cc_media_kind_string(cc_media_kind_t kind)
 {
@@ -49,11 +52,10 @@ const char *cc_media_kind_string(cc_media_kind_t kind)
     }
 }
 
-/*
- * 从协议字符串解析 media kind。
- *
- * 解析策略保持宽松：NULL 或 text 返回文本，未知值落到 file。更严格的能力检查
- * 留给 limits/provider capability 层完成。
+/**
+ * @brief 按准确小写名称解析类型，保留既有缺省映射。
+ * @param[in] kind 稳定借用文本，可为 NULL。
+ * @return NULL 或 text 为 TEXT，已知名对应原类型，未知名和空串为 FILE。
  */
 cc_media_kind_t cc_media_kind_from_string(const char *kind)
 {
@@ -65,11 +67,10 @@ cc_media_kind_t cc_media_kind_from_string(const char *kind)
     return CC_MEDIA_FILE;
 }
 
-/*
- * 配置文本-only 媒体限制。
- *
- * 低资源 MCU 或不支持多模态的 provider 可以直接使用该配置，让 artifact 数量为 0
- * 且禁止 inline base64，从入口处阻断高内存/高带宽内容。
+/**
+ * @brief 将媒体策略清零，设置为禁止任何媒体项的文本模式。
+ * @param[out] limits 输出结构，可为 NULL。
+ * @post 非空策略清零，不释放旧策略借用的数组或字符串。
  */
 void cc_media_limits_text_only(cc_media_limits_t *limits)
 {
@@ -79,11 +80,10 @@ void cc_media_limits_text_only(cc_media_limits_t *limits)
     limits->allow_inline_base64 = 0;
 }
 
-/*
- * 配置默认多模态限制。
- *
- * 默认值给 desktop/embedded Linux profile 一个可用上限，但仍保守限制 artifact
- * 数量和 inline base64 大小。产品侧可以根据 RAM、flash、网络预算继续调小。
+/**
+ * @brief 填写八项、单项十 MiB、编码二 MiB 的默认媒体策略。
+ * @param[out] limits 输出结构，可为 NULL。
+ * @post 清零后允许内联编码，MIME 前缀数为零，旧借用不被释放。
  */
 void cc_media_limits_default_multimodal(cc_media_limits_t *limits)
 {
@@ -95,10 +95,10 @@ void cc_media_limits_default_multimodal(cc_media_limits_t *limits)
     limits->allow_inline_base64 = 1;
 }
 
-/*
- * 初始化单个 artifact。
- *
- * 默认 kind 设为 file，是因为缺少类型信息时 file 是最通用、最少假设的表达。
+/**
+ * @brief 将新或已清理媒体对象初始化为 FILE。
+ * @param[out] artifact 新/已清理对象，可为 NULL。
+ * @post 非空结构清零并设默认类型，不释放此前字段。
  */
 void cc_media_artifact_init(cc_media_artifact_t *artifact)
 {
@@ -107,11 +107,11 @@ void cc_media_artifact_init(cc_media_artifact_t *artifact)
     artifact->kind = CC_MEDIA_FILE;
 }
 
-/*
- * 清理 artifact 拥有的所有字符串资源。
- *
- * artifact 通常作为结构体成员嵌入在 content part 或数组中，因此只释放内部字段
- * 并清零，不释放 artifact 指针本身。
+/**
+ * @brief 消费媒体对象的七个独立拥有字符串。
+ * @param[in,out] artifact 可为 NULL，非空字段须是可独立 free 的唯一分配。
+ * @post 非空结构全部清零，结构本身继续由调用者保管。
+ * @pre owner 已结束全部字段借用，字段不得互相共享同一拥有指针。
  */
 void cc_media_artifact_cleanup(cc_media_artifact_t *artifact)
 {
@@ -126,17 +126,19 @@ void cc_media_artifact_cleanup(cc_media_artifact_t *artifact)
     memset(artifact, 0, sizeof(*artifact));
 }
 
-/*
- * 深拷贝 artifact。
- *
- * 多模态内容可能跨线程、跨 session store 或进入 provider 异步请求，因此不能共享
- * 调用方临时字符串。任一字段复制失败都会 cleanup dst，保持错误路径简单。
+/**
+ * @brief 为不同目标复制全部媒体标量与字符串，自身复制直接成功。
+ * @param[in] src 非 NULL 稳定输入，可持有只读借用字符串。
+ * @param[out] dst 非 NULL 新/已清理对象，允许与 src 相同。
+ * @return 成功为 CC_OK，空参数为 INVALID_ARGUMENT，字符串 OOM 时清理不同目标并返回 OUT_OF_MEMORY。
+ * @note 读取与写入由外层串行化，不同目标不能覆盖源结构或源字段存储。
  */
 cc_result_t cc_media_artifact_copy(const cc_media_artifact_t *src, cc_media_artifact_t *dst)
 {
     if (!src || !dst) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null artifact copy argument");
     }
+    if (src == dst) return cc_result_ok();
     cc_media_artifact_init(dst);
     dst->kind = src->kind;
     dst->id = cc_copy_string(src->id);
@@ -163,11 +165,11 @@ cc_result_t cc_media_artifact_copy(const cc_media_artifact_t *src, cc_media_arti
     return cc_result_ok();
 }
 
-/*
- * 判断 MIME 是否在允许列表内。
- *
- * allowed_mime_prefixes 由调用方拥有；没有配置前缀时表示允许所有非空 MIME。
- * 这个策略适合 SDK 层做最小约束，具体业务可以传入更严格的 allowlist。
+/**
+ * @brief 对非空 MIME 应用可选前缀数组。
+ * @param[in] mime 稳定字符串，可为 NULL。
+ * @param[in] limits 可空稳定策略，非零前缀数对应数组已由外层验证。
+ * @return MIME 非空且至少一个前缀匹配为 1，无前缀策略也为 1，其余为 0。
  */
 static int mime_allowed(const char *mime, const cc_media_limits_t *limits)
 {
@@ -179,11 +181,12 @@ static int mime_allowed(const char *mime, const cc_media_limits_t *limits)
     return 0;
 }
 
-/*
- * 校验单个 artifact 的资源和安全边界。
- *
- * 这里不打开文件，也不访问网络，只检查元数据层面的 MIME、路径穿越和大小限制。
- * 真正的 workspace canonicalize 在 filesystem/path 工具层做；media 层先做低成本防线。
+/**
+ * @brief 对单项声明执行类型、MIME、路径子串和资源预算检查。
+ * @param[in] artifact 非 NULL 稳定元数据，TEXT 不是媒体项。
+ * @param[in] limits 可空稳定策略，正前缀数量必须有数组。
+ * @return 成功为 CC_OK，参数错误为 INVALID_ARGUMENT，策略拒绝为 UNSUPPORTED，path 含 '..' 为 PERMISSION_DENIED。
+ * @note 不检查定位字段必填、真实字节数、尺寸、URI 或 Base64 语法，不访问文件和网络。
  */
 cc_result_t cc_media_artifact_validate(
     const cc_media_artifact_t *artifact,
@@ -192,6 +195,10 @@ cc_result_t cc_media_artifact_validate(
 {
     if (!artifact) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null artifact");
+    }
+    if (limits && (limits->allowed_mime_prefix_count > SIZE_MAX / sizeof(*limits->allowed_mime_prefixes) ||
+        (limits->allowed_mime_prefix_count > 0 && !limits->allowed_mime_prefixes))) {
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Missing MIME prefix array");
     }
     if (artifact->kind == CC_MEDIA_TEXT) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Text is not a media artifact");
@@ -220,11 +227,10 @@ cc_result_t cc_media_artifact_validate(
     return cc_result_ok();
 }
 
-/*
- * 初始化 artifact list。
- *
- * 动态数组从空状态开始，append 时按倍增扩容；这种设计比链表更适合嵌入式 cache
- * 局部性，也便于序列化为 JSON 数组。
+/**
+ * @brief 清零新媒体列表包装。
+ * @param[out] list 新或已清理对象，可为 NULL。
+ * @post 非空结构清零，不消费旧数组与项。
  */
 void cc_media_artifact_list_init(cc_media_artifact_list_t *list)
 {
@@ -232,27 +238,28 @@ void cc_media_artifact_list_init(cc_media_artifact_list_t *list)
     memset(list, 0, sizeof(*list));
 }
 
-/*
- * 清理 artifact list。
- *
- * 先逐个 cleanup 元素，再释放数组缓冲。最后清零可以让调用方在失败路径重复调用
- * cleanup，而不会二次释放。
+/**
+ * @brief 消费媒体数组的有效项与数组分配。
+ * @param[in,out] list 独占拥有包装，可为 NULL，count 为真实有效项数。
+ * @post 包装清零，items 为 NULL 时跳过项访问，结构存储保留。
+ * @pre 结束数组与字段借用，非空数组可被 free 且覆盖 count 项。
  */
 void cc_media_artifact_list_cleanup(cc_media_artifact_list_t *list)
 {
     if (!list) return;
-    for (size_t i = 0; i < list->count; i++) {
+    for (size_t i = 0; list->items && i < list->count; i++) {
         cc_media_artifact_cleanup(&list->items[i]);
     }
     free(list->items);
     memset(list, 0, sizeof(*list));
 }
 
-/*
- * 追加 artifact 到动态数组。
- *
- * 函数会深拷贝 artifact，因此调用方保留原对象所有权。扩容后把新增槽位清零，
- * 让后续 cleanup 在部分初始化状态下也安全。
+/**
+ * @brief 先取得独立媒体副本，再有界扩容并转移到新槽。
+ * @param[in,out] list 已初始化的拥有列表，独占修改，count/capacity 匹配真实分配。
+ * @param[in] artifact 非 NULL 稳定输入，可借自当前列表元素。
+ * @return 成功为 CC_OK，形状错误为 INVALID_ARGUMENT，容量耗尽为 LIMIT_EXCEEDED，复制/扩容失败为 OUT_OF_MEMORY。
+ * @note 所有失败清理临时副本并保留旧项/count，成功扩容使旧 items 地址失效。
  */
 cc_result_t cc_media_artifact_list_append(
     cc_media_artifact_list_t *list,
@@ -262,11 +269,27 @@ cc_result_t cc_media_artifact_list_append(
     if (!list || !artifact) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null artifact list append argument");
     }
+    if (list->count > list->capacity || (list->capacity && !list->items) ||
+        list->capacity > SIZE_MAX / sizeof(*list->items)) {
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid mutable artifact list");
+    }
+    cc_media_artifact_t copy;
+    cc_result_t rc = cc_media_artifact_copy(artifact, &copy);
+    if (rc.code != CC_OK) return rc;
+    cc_result_free(&rc);
     if (list->count == list->capacity) {
-        size_t next_cap = list->capacity ? list->capacity * 2 : 4;
+        size_t maximum = SIZE_MAX / sizeof(*list->items);
+        if (list->capacity == maximum) {
+            cc_media_artifact_cleanup(&copy);
+            return cc_result_error(CC_ERR_LIMIT_EXCEEDED, "Artifact list capacity exhausted");
+        }
+        size_t next_cap = list->capacity == 0 ? 4 :
+            list->capacity > maximum / 2 ? maximum : list->capacity * 2;
+        if (next_cap > maximum) next_cap = maximum;
         cc_media_artifact_t *next =
             realloc(list->items, next_cap * sizeof(cc_media_artifact_t));
         if (!next) {
+            cc_media_artifact_cleanup(&copy);
             return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to grow artifact list");
         }
         memset(next + list->capacity, 0,
@@ -274,17 +297,16 @@ cc_result_t cc_media_artifact_list_append(
         list->items = next;
         list->capacity = next_cap;
     }
-    cc_result_t rc = cc_media_artifact_copy(artifact, &list->items[list->count]);
-    if (rc.code != CC_OK) return rc;
+    list->items[list->count] = copy;
     list->count++;
     return cc_result_ok();
 }
 
-/*
- * 深拷贝 artifact list。
- *
- * 逐项复用 append 的深拷贝逻辑；任何一项失败都会清理 dst，保证调用方不需要
- * 根据 count 判断哪些元素已经成功。
+/**
+ * @brief 向不同的空目标逐项深拷贝媒体列表，自身复制保持原对象。
+ * @param[in] src 非 NULL 稳定读取视图，items 覆盖 count，不依赖 capacity。
+ * @param[out] dst 非 NULL 新/已清理包装，允许等于 src。
+ * @return 成功为 CC_OK，参数/源形状错误为 INVALID_ARGUMENT，项复制或增长失败清空不同目标并交付原错误。
  */
 cc_result_t cc_media_artifact_list_copy(
     const cc_media_artifact_list_t *src,
@@ -294,6 +316,9 @@ cc_result_t cc_media_artifact_list_copy(
     if (!src || !dst) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null artifact list copy argument");
     }
+    if (src->count > SIZE_MAX / sizeof(*src->items) || (src->count && !src->items))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Missing artifact list items");
+    if (src == dst) return cc_result_ok();
     cc_media_artifact_list_init(dst);
     for (size_t i = 0; i < src->count; i++) {
         cc_result_t rc = cc_media_artifact_list_append(dst, &src->items[i]);
@@ -305,21 +330,24 @@ cc_result_t cc_media_artifact_list_copy(
     return cc_result_ok();
 }
 
-/*
- * 校验 artifact list 的整体限制。
- *
- * max_artifacts 是列表级预算，每个 artifact 的 MIME/大小/base64 再交给单项校验。
- * 这让 provider capability 和 runtime limits 可以组合使用。
+/**
+ * @brief 核对列表计数与各媒体项的策略。
+ * @param[in] list 非 NULL 稳定只读视图，items 覆盖 count，capacity 不参与读取。
+ * @param[in] limits 可空稳定策略，数量上限零表示不允许媒体项。
+ * @return 成功为 CC_OK，形状/策略数组错误为 INVALID_ARGUMENT，其余首个策略错误原样返回。
  */
 cc_result_t cc_media_artifact_list_validate(
     const cc_media_artifact_list_t *list,
     const cc_media_limits_t *limits
 )
 {
-    if (!list) {
+    if (!list || list->count > SIZE_MAX / sizeof(*list->items) || (list->count && !list->items)) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null artifact list");
     }
-    /* A zero artifact budget is the explicit text-only/fail-closed mode. */
+    if (limits && (limits->allowed_mime_prefix_count > SIZE_MAX / sizeof(*limits->allowed_mime_prefixes) ||
+        (limits->allowed_mime_prefix_count > 0 && !limits->allowed_mime_prefixes)))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Missing MIME prefix array");
+    /* max_artifacts 为零是显式禁止媒体项的文本模式。 */
     if (limits && list->count > limits->max_artifacts) {
         return cc_result_error(CC_ERR_UNSUPPORTED, "Artifact count exceeds max_artifacts");
     }
@@ -330,122 +358,179 @@ cc_result_t cc_media_artifact_list_validate(
     return cc_result_ok();
 }
 
-/*
- * 如果字符串字段存在则写入 JSON。
- *
- * JSON payload 尽量省略空字段，减少 provider 请求大小，也避免把“空字符串”和
- * “字段不存在”混成同一个语义。
+/**
+ * @brief 仅在非空字符串存在时写入字段，并报告创建和挂接结果。
+ * @param[in,out] obj 调用期间借用的有效 JSON 对象，调用者串行构造。
+ * @param[in] key 借用字段名，底层复制名称。
+ * @param[in] value 借用正文，NULL 或空字符串表示省略。
+ * @return 字段省略或完整挂接成功为一，内存分配或挂接失败为零。
  */
-static void json_set_string_if_present(cc_json_value_t *obj, const char *key, const char *value)
+static int json_set_string_if_present(cc_json_value_t *obj, const char *key, const char *value)
 {
-    if (value && *value) {
-        cc_json_object_set(obj, key, cc_json_create_string(value));
-    }
+    return !value || !*value || cc_json_object_set_owned(obj, key, cc_json_create_string(value));
 }
 
-/*
- * 如果数值为正则写入 JSON。
- *
- * 媒体尺寸和时长的 0 通常表示未知，省略字段比输出 0 更符合协议含义。
+/**
+ * @brief 仅在数值为正时写入媒体尺寸或时长字段。
+ * @param[in,out] obj 调用期间借用的有效 JSON 对象，调用者串行构造。
+ * @param[in] key 借用字段名，底层复制名称。
+ * @param[in] value 要写入的数值，非正值沿用未知值省略规则。
+ * @return 字段省略或完整挂接成功为一，创建或挂接失败为零。
  */
-static void json_set_number_if_positive(cc_json_value_t *obj, const char *key, double value)
+static int json_set_number_if_positive(cc_json_value_t *obj, const char *key, double value)
 {
-    if (value > 0) {
-        cc_json_object_set(obj, key, cc_json_create_number(value));
-    }
+    return !(value > 0) || cc_json_object_set_owned(obj, key, cc_json_create_number(value));
 }
 
-/*
- * 将 artifact 转成 JSON object。
- *
- * 该 helper 只构建单个对象，不负责数组生命周期；调用方把返回对象交给 JSON AST
- * 后由 cc_json_destroy() 统一释放。
+/**
+ * @brief 构造完整媒体对象，任一应有字段写入失败时销毁临时树。
+ * @param[in] artifact 调用期间借用的有效稳定媒体记录。
+ * @param[out] out_object 非 NULL 独立输出槽，先置 NULL，成功交接未挂接的拥有对象。
+ * @return 成功为 CC_OK，bytes 的 double 表示越出 size_t 范围为 LIMIT_EXCEEDED，其余节点失败为 OUT_OF_MEMORY。
+ * @note 读取期间源记录须保持稳定，省略规则沿用可选字符串及正数元数据约定。
  */
-static cc_json_value_t *artifact_to_json_object(const cc_media_artifact_t *artifact)
+static cc_result_t artifact_to_json_object(
+    const cc_media_artifact_t *artifact, cc_json_value_t **out_object)
 {
+    *out_object = NULL;
+    double bytes = (double)artifact->bytes;
+    double upper_bound = (double)(SIZE_MAX / 2U + 1U) * 2.0;
+    if (bytes >= upper_bound)
+        return cc_result_error(CC_ERR_LIMIT_EXCEEDED, "Artifact field 'bytes' exceeds JSON numeric representation");
     cc_json_value_t *obj = cc_json_create_object();
-    if (!obj) return NULL;
-    cc_json_object_set(obj, "kind",
-        cc_json_create_string(cc_media_kind_string(artifact->kind)));
-    json_set_string_if_present(obj, "id", artifact->id);
-    json_set_string_if_present(obj, "mime", artifact->mime);
-    json_set_string_if_present(obj, "path", artifact->path);
-    json_set_string_if_present(obj, "uri", artifact->uri);
-    json_set_string_if_present(obj, "data_base64", artifact->data_base64);
-    json_set_number_if_positive(obj, "bytes", (double)artifact->bytes);
-    json_set_number_if_positive(obj, "width", (double)artifact->width);
-    json_set_number_if_positive(obj, "height", (double)artifact->height);
-    json_set_number_if_positive(obj, "duration_ms", (double)artifact->duration_ms);
-    json_set_string_if_present(obj, "created_at", artifact->created_at);
-    json_set_string_if_present(obj, "metadata", artifact->metadata);
-    return obj;
+    if (!obj) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to allocate artifact JSON");
+    if (!cc_json_object_set_owned(obj, "kind", cc_json_create_string(cc_media_kind_string(artifact->kind))) ||
+        !json_set_string_if_present(obj, "id", artifact->id) ||
+        !json_set_string_if_present(obj, "mime", artifact->mime) ||
+        !json_set_string_if_present(obj, "path", artifact->path) ||
+        !json_set_string_if_present(obj, "uri", artifact->uri) ||
+        !json_set_string_if_present(obj, "data_base64", artifact->data_base64) ||
+        !json_set_number_if_positive(obj, "bytes", bytes) ||
+        !json_set_number_if_positive(obj, "width", (double)artifact->width) ||
+        !json_set_number_if_positive(obj, "height", (double)artifact->height) ||
+        !json_set_number_if_positive(obj, "duration_ms", (double)artifact->duration_ms) ||
+        !json_set_string_if_present(obj, "created_at", artifact->created_at) ||
+        !json_set_string_if_present(obj, "metadata", artifact->metadata)) {
+        cc_json_destroy(obj);
+        return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to serialize artifact fields");
+    }
+    *out_object = obj;
+    return cc_result_ok();
 }
 
-/*
- * 从 JSON object 解析 artifact。
- *
- * 输出 artifact 先初始化，再逐字段深拷贝；如果某个存在的字符串字段复制失败，
- * 函数会清理 artifact 并返回 OOM，避免调用方处理半解析对象。
+/**
+ * @brief 对已知字段查重和类型检查后，构造完整拥有媒体记录。
+ * @param[in] obj 稳定 JSON 节点，须为对象，已由外层拒绝原文解码 NUL。
+ * @param[out] artifact 非 NULL 新/已清理输出，先初始化，字段失败时清理。
+ * @return 成功为 CC_OK，空输出为 INVALID_ARGUMENT，schema/bytes 范围错误为 JSON，字段分配失败为 OUT_OF_MEMORY。
+ * @note 缺 kind 沿旧 TEXT 默认，未知字符串为 FILE；正 bytes 小数截断，有限 int 字段沿 cJSON 饱和视图。
  */
 static cc_result_t artifact_from_json_object(
     const cc_json_value_t *obj,
     cc_media_artifact_t *artifact
 )
 {
-    if (!obj || !cc_json_is_object(obj) || !artifact) {
+    if (!artifact) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid artifact JSON object");
     }
     cc_media_artifact_init(artifact);
-    artifact->kind = cc_media_kind_from_string(
-        cc_json_string_value(cc_json_object_get(obj, "kind")));
-    artifact->id = cc_copy_string(cc_json_string_value(cc_json_object_get(obj, "id")));
-    artifact->mime = cc_copy_string(cc_json_string_value(cc_json_object_get(obj, "mime")));
-    artifact->path = cc_copy_string(cc_json_string_value(cc_json_object_get(obj, "path")));
-    artifact->uri = cc_copy_string(cc_json_string_value(cc_json_object_get(obj, "uri")));
-    artifact->data_base64 = cc_copy_string(cc_json_string_value(cc_json_object_get(obj, "data_base64")));
-    artifact->bytes = (size_t)cc_json_number_value(cc_json_object_get(obj, "bytes"));
-    artifact->width = cc_json_int_value(cc_json_object_get(obj, "width"));
-    artifact->height = cc_json_int_value(cc_json_object_get(obj, "height"));
-    artifact->duration_ms = cc_json_int_value(cc_json_object_get(obj, "duration_ms"));
-    artifact->created_at = cc_copy_string(cc_json_string_value(cc_json_object_get(obj, "created_at")));
-    artifact->metadata = cc_copy_string(cc_json_string_value(cc_json_object_get(obj, "metadata")));
-    if ((cc_json_object_get(obj, "id") && !artifact->id) ||
-        (cc_json_object_get(obj, "mime") && !artifact->mime) ||
-        (cc_json_object_get(obj, "path") && !artifact->path) ||
-        (cc_json_object_get(obj, "uri") && !artifact->uri) ||
-        (cc_json_object_get(obj, "data_base64") && !artifact->data_base64) ||
-        (cc_json_object_get(obj, "created_at") && !artifact->created_at) ||
-        (cc_json_object_get(obj, "metadata") && !artifact->metadata)) {
-        cc_media_artifact_cleanup(artifact);
-        return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to parse artifact");
+    if (!obj || !cc_json_is_object(obj))
+        return cc_result_error(CC_ERR_JSON, "Artifact must be an object");
+    static const char *const fields[] = {
+        "kind", "id", "mime", "path", "uri", "data_base64", "bytes", "width",
+        "height", "duration_ms", "created_at", "metadata"
+    };
+    const char *duplicate = cc_json_duplicate_known_field(obj, fields, sizeof(fields) / sizeof(fields[0]));
+    if (duplicate)
+        return cc_result_errf(CC_ERR_JSON, "Duplicate artifact field '%s'", duplicate);
+    static const char *const string_fields[] = {
+        "kind", "id", "mime", "path", "uri", "data_base64", "created_at", "metadata"
+    };
+    char **outputs[] = {
+        NULL, &artifact->id, &artifact->mime, &artifact->path, &artifact->uri,
+        &artifact->data_base64, &artifact->created_at, &artifact->metadata
+    };
+    cc_result_t rc = cc_result_ok();
+    artifact->kind = CC_MEDIA_TEXT;
+    for (size_t i = 0; i < sizeof(string_fields) / sizeof(string_fields[0]); i++) {
+        cc_json_value_t *value = cc_json_object_get(obj, string_fields[i]);
+        if (!value) continue;
+        if (!cc_json_is_string(value)) {
+            rc = cc_result_errf(CC_ERR_JSON, "Artifact field '%s' must be a string", string_fields[i]);
+            goto fail;
+        }
+        if (i == 0) {
+            artifact->kind = cc_media_kind_from_string(cc_json_string_value(value));
+            continue;
+        }
+        *outputs[i] = cc_copy_string(cc_json_string_value(value));
+        if (!*outputs[i]) {
+            rc = cc_result_errf(CC_ERR_OUT_OF_MEMORY, "Failed to copy artifact field '%s'", string_fields[i]);
+            goto fail;
+        }
+    }
+    cc_json_value_t *bytes = cc_json_object_get(obj, "bytes");
+    if (bytes) {
+        double value = cc_json_number_value(bytes);
+        double upper_bound = (double)(SIZE_MAX / 2U + 1U) * 2.0;
+        if (!cc_json_is_number(bytes) || !isfinite(value) || value < 0 || value >= upper_bound) {
+            rc = cc_result_error(CC_ERR_JSON, "Artifact field 'bytes' is outside the size_t range");
+            goto fail;
+        }
+        artifact->bytes = (size_t)value;
+    }
+    static const char *const number_fields[] = {"width", "height", "duration_ms"};
+    int *numbers[] = {&artifact->width, &artifact->height, &artifact->duration_ms};
+    for (size_t i = 0; i < sizeof(number_fields) / sizeof(number_fields[0]); i++) {
+        cc_json_value_t *value = cc_json_object_get(obj, number_fields[i]);
+        if (!value) continue;
+        if (!cc_json_is_number(value) || !isfinite(cc_json_number_value(value))) {
+            rc = cc_result_errf(CC_ERR_JSON, "Artifact field '%s' must be a finite number", number_fields[i]);
+            goto fail;
+        }
+        *numbers[i] = cc_json_int_value(value);
     }
     return cc_result_ok();
+fail:
+    cc_media_artifact_cleanup(artifact);
+    return rc;
 }
 
-/*
- * 序列化 artifact list。
- *
- * 这里使用 JSON AST 生成字符串，避免手工拼接时遗漏转义。返回的 out_json 由调用方
- * free()，函数失败时 out_json 保持 NULL。
+/**
+ * @brief 完整序列化媒体记录数组，任何字段或节点失败时撤销输出。
+ * @param[in] list 调用期间借用的稳定列表，非空列表须具有有效 items。
+ * @param[out] out_json 输出独占字符串，调用者 free，失败为 NULL。
+ * @return 成功为 CC_OK，参数、数值表示上限或内存错误的拥有结果由调用者释放。
+ * @note 无内部共享写入，同一源列表的并发修改须由调用者排除。
  */
 cc_result_t cc_media_artifact_list_to_json(
     const cc_media_artifact_list_t *list,
     char **out_json
 )
 {
-    if (!list || !out_json) {
+    if (!out_json) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null artifact JSON argument");
     }
     *out_json = NULL;
+    if (!list || list->count > SIZE_MAX / sizeof(*list->items) || (list->count && !list->items))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid artifact list");
     cc_json_value_t *arr = cc_json_create_array();
     if (!arr) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to allocate artifact JSON");
     for (size_t i = 0; i < list->count; i++) {
-        cc_json_value_t *obj = artifact_to_json_object(&list->items[i]);
-        if (!obj) {
+        cc_json_value_t *obj = NULL;
+        cc_result_t rc = artifact_to_json_object(&list->items[i], &obj);
+        if (rc.code != CC_OK) {
+            cc_result_t error = cc_result_errf(rc.code, "Artifact[%zu]: %s", i,
+                rc.message ? rc.message : "serialization failed");
+            cc_result_free(&rc);
             cc_json_destroy(arr);
-            return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to serialize artifact");
+            return error;
         }
-        cc_json_array_append(arr, obj);
+        cc_result_free(&rc);
+        if (!cc_json_array_append_owned(arr, obj)) {
+            cc_json_destroy(arr);
+            return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to append artifact JSON");
+        }
     }
     *out_json = cc_json_stringify_unformatted(arr);
     cc_json_destroy(arr);
@@ -453,11 +538,12 @@ cc_result_t cc_media_artifact_list_to_json(
                      : cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to stringify artifacts");
 }
 
-/*
- * 从 JSON 数组解析 artifact list。
- *
- * 空字符串按空列表处理，方便配置文件里省略多模态字段。解析每个临时 artifact 后
- * append 深拷贝到 list，再立即 cleanup 临时对象，所有权边界清晰。
+/**
+ * @brief 完整解析媒体数组，逐项深拷贝，任一坏项撤销全部输出。
+ * @param[in] json 稳定 NUL 文本，NULL/空串表示空列表，其他文本要求完整尾部且无解码 NUL。
+ * @param[out] out_list 非 NULL 新/已清理包装，先初始化，所有失败后保持空列表。
+ * @return 成功为 CC_OK，空输出为 INVALID_ARGUMENT，损坏/schema/通用解析失败为 JSON，字段复制或列表分配失败为 OUT_OF_MEMORY。
+ * @note 失败诊断保留项索引和字段，原始文本未修改；源 JSON 借用不得被输出初始化覆盖。
  */
 cc_result_t cc_media_artifact_list_from_json(
     const char *json,
@@ -469,22 +555,29 @@ cc_result_t cc_media_artifact_list_from_json(
     }
     cc_media_artifact_list_init(out_list);
     if (!json || !*json) return cc_result_ok();
+    if (cc_storage_json_has_nul_escape(json))
+        return cc_result_error(CC_ERR_JSON, "Artifacts JSON contains a decoded NUL");
     cc_json_value_t *root = NULL;
-    cc_result_t rc = cc_json_parse(json, &root);
+    cc_result_t rc = cc_json_parse_strict(json, &root);
     if (rc.code != CC_OK) return rc;
     if (!cc_json_is_array(root)) {
         cc_json_destroy(root);
         return cc_result_error(CC_ERR_JSON, "Artifacts JSON must be an array");
     }
+    cc_result_free(&rc);
     int n = cc_json_array_size(root);
     for (int i = 0; i < n; i++) {
         cc_media_artifact_t artifact;
         rc = artifact_from_json_object(cc_json_array_get(root, i), &artifact);
         if (rc.code != CC_OK) {
+            cc_result_t error = cc_result_errf(rc.code, "Artifact[%d]: %s", i,
+                rc.message ? rc.message : "invalid artifact");
+            cc_result_free(&rc);
             cc_json_destroy(root);
             cc_media_artifact_list_cleanup(out_list);
-            return rc;
+            return error;
         }
+        cc_result_free(&rc);
         rc = cc_media_artifact_list_append(out_list, &artifact);
         cc_media_artifact_cleanup(&artifact);
         if (rc.code != CC_OK) {
@@ -492,26 +585,30 @@ cc_result_t cc_media_artifact_list_from_json(
             cc_media_artifact_list_cleanup(out_list);
             return rc;
         }
+        cc_result_free(&rc);
     }
     cc_json_destroy(root);
     return cc_result_ok();
 }
 
-/*
- * 生成人类可读 artifact 摘要。
- *
- * 摘要用于日志、memory 和调试 UI，不是稳定机器协议。函数使用 string builder
- * 累积内容，任意 append 失败都会释放 builder，避免泄漏部分字符串。
+/**
+ * @brief 拼接媒体类型、身份、位置和正尺寸等声明字段的可读摘要。
+ * @param[in] list 非 NULL 稳定只读列表，items 覆盖 count，capacity 不参与读取。
+ * @param[out] out_summary 非 NULL 独立输出槽，先置 NULL，成功接管 free 可释放缓冲。
+ * @return 成功为 CC_OK，参数/形状错误为 INVALID_ARGUMENT，builder 首次失败结果原样交付。
+ * @note 失败释放构造缓冲，输入和字段在调用期间稳定，输出槽不得覆盖源字段。
  */
 cc_result_t cc_media_artifact_list_summarize(
     const cc_media_artifact_list_t *list,
     char **out_summary
 )
 {
-    if (!list || !out_summary) {
+    if (!out_summary) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null artifact summary argument");
     }
     *out_summary = NULL;
+    if (!list || list->count > SIZE_MAX / sizeof(*list->items) || (list->count && !list->items))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid artifact summary list");
     cc_string_builder_t sb;
     cc_result_t rc = cc_string_builder_init(&sb);
     if (rc.code != CC_OK) return rc;
@@ -548,11 +645,10 @@ cc_result_t cc_media_artifact_list_summarize(
                         : cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to allocate artifact summary");
 }
 
-/*
- * 清理单个 content part。
- *
- * 不管当前 part 是文本还是 artifact，都释放两个可能持有资源的字段，最后清零。
- * 这种幂等风格让数组清理和错误回滚更简单。
+/**
+ * @brief 消费内容项的文本与媒体拥有字段。
+ * @param[in,out] part 独占拥有对象，可为 NULL，各非空字段须为独立分配。
+ * @post 非空结构清零，结构存储保留，清理前结束全部借用。
  */
 void cc_content_part_cleanup(cc_content_part_t *part)
 {
@@ -562,17 +658,19 @@ void cc_content_part_cleanup(cc_content_part_t *part)
     memset(part, 0, sizeof(*part));
 }
 
-/*
- * 深拷贝 content part。
- *
- * 文本 part 只复制 text；artifact part 还要复制完整 artifact。kind/direction 先复制，
- * 失败时 cleanup dst，保证 dst 不会留下已分配但未登记的字段。
+/**
+ * @brief 复制标记、可选文本及非 TEXT 媒体，完全自身复制为空操作。
+ * @param[in] src 非 NULL 稳定输入。
+ * @param[out] dst 非 NULL 新/已清理输出，允许与 src 相同。
+ * @return 成功为 CC_OK，空参数为 INVALID_ARGUMENT，复制 OOM 时不同目标无半成品。
+ * @note TEXT 项中未使用的媒体字段不复制，不同目标不得覆盖源字段存储。
  */
 cc_result_t cc_content_part_copy(const cc_content_part_t *src, cc_content_part_t *dst)
 {
     if (!src || !dst) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null content part copy argument");
     }
+    if (src == dst) return cc_result_ok();
     memset(dst, 0, sizeof(*dst));
     dst->kind = src->kind;
     dst->direction = src->direction;
@@ -590,10 +688,10 @@ cc_result_t cc_content_part_copy(const cc_content_part_t *src, cc_content_part_t
     return cc_result_ok();
 }
 
-/*
- * 初始化 content parts 动态数组。
- *
- * content parts 是 message 的核心容器，空状态表示没有任何文本或多模态片段。
+/**
+ * @brief 清零新内容列表包装。
+ * @param[out] parts 新或已清理结构，可为 NULL。
+ * @post 非空结构清零，不释放旧数组或项。
  */
 void cc_content_parts_init(cc_content_parts_t *parts)
 {
@@ -601,31 +699,40 @@ void cc_content_parts_init(cc_content_parts_t *parts)
     memset(parts, 0, sizeof(*parts));
 }
 
-/*
- * 清理 content parts 数组。
- *
- * 先清理每个 part 的内部资源，再释放数组缓冲；适合 message cleanup 和解析失败回滚。
+/**
+ * @brief 消费内容数组每个有效项及数组分配。
+ * @param[in,out] parts 独占拥有列表，可为 NULL，count 位于真实数组边界内。
+ * @post 包装清零，items 为 NULL 时跳过项，结构存储保留。
+ * @pre owner 已排空数组和字段借用，非空数组可由 free 释放。
  */
 void cc_content_parts_cleanup(cc_content_parts_t *parts)
 {
     if (!parts) return;
-    for (size_t i = 0; i < parts->count; i++) {
+    for (size_t i = 0; parts->items && i < parts->count; i++) {
         cc_content_part_cleanup(&parts->items[i]);
     }
     free(parts->items);
     memset(parts, 0, sizeof(*parts));
 }
 
-/*
- * 确保 content parts 至少有一个可写槽位。
- *
- * 使用倍增扩容降低 append 的均摊成本。扩容后清零新增槽位，是为了让后续错误路径
- * 能安全调用 cc_content_part_cleanup()。
+/**
+ * @brief 在检查可写状态与容量算术后，为内容列表保留一个新槽。
+ * @param[in,out] parts 非 NULL 已初始化拥有列表，调用者独占修改。
+ * @return 成功为 CC_OK，非法 count/capacity/数组为 INVALID_ARGUMENT，容量耗尽为 LIMIT_EXCEEDED，realloc 失败为 OUT_OF_MEMORY。
+ * @note 新增容量清零，失败保留旧数组和容量，成功可能使所有旧元素指针失效。
  */
 static cc_result_t content_parts_reserve(cc_content_parts_t *parts)
 {
+    if (parts->count > parts->capacity || (parts->capacity && !parts->items) ||
+        parts->capacity > SIZE_MAX / sizeof(*parts->items))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid mutable content parts");
     if (parts->count < parts->capacity) return cc_result_ok();
-    size_t next_cap = parts->capacity ? parts->capacity * 2 : 4;
+    size_t maximum = SIZE_MAX / sizeof(*parts->items);
+    if (parts->capacity == maximum)
+        return cc_result_error(CC_ERR_LIMIT_EXCEEDED, "Content parts capacity exhausted");
+    size_t next_cap = parts->capacity == 0 ? 4 :
+        parts->capacity > maximum / 2 ? maximum : parts->capacity * 2;
+    if (next_cap > maximum) next_cap = maximum;
     cc_content_part_t *next = realloc(parts->items, next_cap * sizeof(cc_content_part_t));
     if (!next) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to grow content parts");
     memset(next + parts->capacity, 0, (next_cap - parts->capacity) * sizeof(cc_content_part_t));
@@ -634,11 +741,12 @@ static cc_result_t content_parts_reserve(cc_content_parts_t *parts)
     return cc_result_ok();
 }
 
-/*
- * 追加文本 part。
- *
- * NULL 文本被转换为空字符串，保持序列化时字段总是可用。append 成功后 count 才
- * 增加，因此复制失败时数组状态不变。
+/**
+ * @brief 在任何数组搬迁前复制文本，再转移到新 TEXT 槽。
+ * @param[in,out] parts 非 NULL 初始化拥有列表，独占修改。
+ * @param[in] text 调用期间借用文本，可为 NULL，按空串复制，可借自当前数组存储。
+ * @param[in] direction 原样保存的方向标记。
+ * @return 成功为 CC_OK，形状/容量/分配失败返回对应结果，失败不改变旧项和 count。
  */
 cc_result_t cc_content_parts_append_text(
     cc_content_parts_t *parts,
@@ -647,24 +755,33 @@ cc_result_t cc_content_parts_append_text(
 )
 {
     if (!parts) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null content parts");
+    if (parts->count > parts->capacity || (parts->capacity && !parts->items) ||
+        parts->capacity > SIZE_MAX / sizeof(*parts->items))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid mutable content parts");
+    char *copy = cc_copy_string(text ? text : "");
+    if (!copy) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to copy text part");
     cc_result_t rc = content_parts_reserve(parts);
-    if (rc.code != CC_OK) return rc;
+    if (rc.code != CC_OK) {
+        free(copy);
+        return rc;
+    }
+    cc_result_free(&rc);
     cc_content_part_t *part = &parts->items[parts->count];
     memset(part, 0, sizeof(*part));
     part->kind = CC_MEDIA_TEXT;
     part->direction = direction;
-    part->text = cc_copy_string(text ? text : "");
-    if (!part->text) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to copy text part");
+    part->text = copy;
     parts->count++;
     return cc_result_ok();
 }
 
 
-/*
- * 追加 artifact part。
- *
- * artifact 会被深拷贝到新槽位，调用方可以立即释放原 artifact。kind 来自 artifact
- * 本身，保证内容类型和 artifact 元数据一致。
+/**
+ * @brief 先复制媒体，再扩容并转移副本到内容槽。
+ * @param[in,out] parts 非 NULL 已初始化拥有列表，独占修改。
+ * @param[in] artifact 非 NULL 稳定输入，可借自本列表内嵌媒体，原 owner 保留原字段。
+ * @param[in] direction 原样保存的方向标记，kind 从媒体副本取得。
+ * @return 成功为 CC_OK，坏参数/形状、容量耗尽或 OOM 返回对应错误，失败清理副本并保留旧项/count。
  */
 cc_result_t cc_content_parts_append_artifact(
     cc_content_parts_t *parts,
@@ -675,29 +792,42 @@ cc_result_t cc_content_parts_append_artifact(
     if (!parts || !artifact) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null content artifact part");
     }
-    cc_result_t rc = content_parts_reserve(parts);
+    if (parts->count > parts->capacity || (parts->capacity && !parts->items) ||
+        parts->capacity > SIZE_MAX / sizeof(*parts->items))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid mutable content parts");
+    cc_media_artifact_t copy;
+    cc_result_t rc = cc_media_artifact_copy(artifact, &copy);
     if (rc.code != CC_OK) return rc;
+    cc_result_free(&rc);
+    rc = content_parts_reserve(parts);
+    if (rc.code != CC_OK) {
+        cc_media_artifact_cleanup(&copy);
+        return rc;
+    }
+    cc_result_free(&rc);
     cc_content_part_t *part = &parts->items[parts->count];
     memset(part, 0, sizeof(*part));
-    part->kind = artifact->kind;
+    part->kind = copy.kind;
     part->direction = direction;
-    rc = cc_media_artifact_copy(artifact, &part->artifact);
-    if (rc.code != CC_OK) return rc;
+    part->artifact = copy;
     parts->count++;
     return cc_result_ok();
 }
 
-/*
- * 深拷贝 content parts。
- *
- * 逐项复制可以复用单个 part 的所有权规则；任何失败都会清理 dst，避免调用方根据
- * dst->count 做复杂回滚。
+/**
+ * @brief 为不同空目标逐项复制内容列表，自身复制保持原状态。
+ * @param[in] src 非 NULL 稳定只读列表，items 覆盖 count，允许视图 capacity<count。
+ * @param[out] dst 非 NULL 新/已清理拥有包装，允许与 src 相同。
+ * @return 成功为 CC_OK，源形状/参数错误为 INVALID_ARGUMENT，复制失败清空不同目标并返回原错误。
  */
 cc_result_t cc_content_parts_copy(const cc_content_parts_t *src, cc_content_parts_t *dst)
 {
     if (!src || !dst) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null content parts copy argument");
     }
+    if (src->count > SIZE_MAX / sizeof(*src->items) || (src->count && !src->items))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Missing content parts items");
+    if (src == dst) return cc_result_ok();
     cc_content_parts_init(dst);
     for (size_t i = 0; i < src->count; i++) {
         cc_result_t rc = content_parts_reserve(dst);
@@ -715,18 +845,20 @@ cc_result_t cc_content_parts_copy(const cc_content_parts_t *src, cc_content_part
     return cc_result_ok();
 }
 
-/*
- * 校验 content parts 的多模态限制。
- *
- * 文本片段不进入 artifact 限制；非文本 part 先收集到临时 artifact list，再复用
- * artifact list 校验逻辑，避免维护两套 max_artifacts/MIME 规则。
+/**
+ * @brief 将非 TEXT 媒体深拷贝到临时列表并复用媒体策略校验。
+ * @param[in] parts 非 NULL 稳定只读列表，items 覆盖 count，不使用 capacity 读取边界。
+ * @param[in] limits 可空稳定策略。
+ * @return 成功为 CC_OK，坏形状、临时副本 OOM、数量或单项策略错误交付对应结果。
+ * @note 所有临时拥有字段在返回前清理，文本不计入媒体预算，无内部锁。
  */
 cc_result_t cc_content_parts_validate(
     const cc_content_parts_t *parts,
     const cc_media_limits_t *limits
 )
 {
-    if (!parts) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null content parts");
+    if (!parts || parts->count > SIZE_MAX / sizeof(*parts->items) || (parts->count && !parts->items))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid content parts");
     cc_media_artifact_list_t artifacts;
     cc_media_artifact_list_init(&artifacts);
     for (size_t i = 0; i < parts->count; i++) {
@@ -742,18 +874,21 @@ cc_result_t cc_content_parts_validate(
     return rc;
 }
 
-/*
- * 序列化 content parts。
- *
- * 每个 part 输出 type 和 direction；文本直接输出 text，非文本输出 artifact object。
- * 该格式是 SDK 内部稳定交换格式，provider adapter 可再转换成具体供应商协议。
+/**
+ * @brief 完整序列化文本及媒体内容数组，任一节点构造失败时撤销输出。
+ * @param[in] parts 调用期间借用的稳定内容列表，非空列表须具有有效 items。
+ * @param[out] out_json 输出独占字符串，调用者 free，失败为 NULL。
+ * @return 成功为 CC_OK，参数、媒体数值表示上限或内存错误的拥有结果由调用者释放。
+ * @note 每项保留 type、direction 及 text 或 artifact，同一源列表的写入须外层同步。
  */
 cc_result_t cc_content_parts_to_json(const cc_content_parts_t *parts, char **out_json)
 {
-    if (!parts || !out_json) {
+    if (!out_json) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null content parts JSON argument");
     }
     *out_json = NULL;
+    if (!parts || parts->count > SIZE_MAX / sizeof(*parts->items) || (parts->count && !parts->items))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid content parts");
     cc_json_value_t *arr = cc_json_create_array();
     if (!arr) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to allocate parts JSON");
     for (size_t i = 0; i < parts->count; i++) {
@@ -763,21 +898,41 @@ cc_result_t cc_content_parts_to_json(const cc_content_parts_t *parts, char **out
             cc_json_destroy(arr);
             return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to allocate content part JSON");
         }
-        cc_json_object_set(obj, "type", cc_json_create_string(cc_media_kind_string(part->kind)));
-        cc_json_object_set(obj, "direction",
-            cc_json_create_string(part->direction == CC_CONTENT_PART_OUTPUT ? "output" : "input"));
+        if (!cc_json_object_set_owned(obj, "type", cc_json_create_string(cc_media_kind_string(part->kind))) ||
+            !cc_json_object_set_owned(obj, "direction",
+                cc_json_create_string(part->direction == CC_CONTENT_PART_OUTPUT ? "output" : "input"))) {
+            cc_json_destroy(obj);
+            cc_json_destroy(arr);
+            return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to set content part fields");
+        }
         if (part->kind == CC_MEDIA_TEXT) {
-            cc_json_object_set(obj, "text", cc_json_create_string(part->text ? part->text : ""));
-        } else {
-            cc_json_value_t *artifact = artifact_to_json_object(&part->artifact);
-            if (!artifact) {
+            if (!cc_json_object_set_owned(obj, "text", cc_json_create_string(part->text ? part->text : ""))) {
                 cc_json_destroy(obj);
                 cc_json_destroy(arr);
-                return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to serialize part artifact");
+                return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to set content text");
             }
-            cc_json_object_set(obj, "artifact", artifact);
+        } else {
+            cc_json_value_t *artifact = NULL;
+            cc_result_t rc = artifact_to_json_object(&part->artifact, &artifact);
+            if (rc.code != CC_OK) {
+                cc_result_t error = cc_result_errf(rc.code, "Content part[%zu]: %s", i,
+                    rc.message ? rc.message : "artifact serialization failed");
+                cc_result_free(&rc);
+                cc_json_destroy(obj);
+                cc_json_destroy(arr);
+                return error;
+            }
+            cc_result_free(&rc);
+            if (!cc_json_object_set_owned(obj, "artifact", artifact)) {
+                cc_json_destroy(obj);
+                cc_json_destroy(arr);
+                return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to set part artifact");
+            }
         }
-        cc_json_array_append(arr, obj);
+        if (!cc_json_array_append_owned(arr, obj)) {
+            cc_json_destroy(arr);
+            return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to append content part JSON");
+        }
     }
     *out_json = cc_json_stringify_unformatted(arr);
     cc_json_destroy(arr);
@@ -785,11 +940,12 @@ cc_result_t cc_content_parts_to_json(const cc_content_parts_t *parts, char **out
                      : cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to stringify content parts");
 }
 
-/*
- * 从 JSON 解析 content parts。
- *
- * 解析时允许旧格式把 artifact 字段直接放在 part object 上，以兼容早期测试数据。
- * 任一 part 解析失败都会清理 out_parts，保证调用方不需要处理部分列表。
+/**
+ * @brief 完整解析内容数组，任一坏项或已知字段错误撤销整列表。
+ * @param[in] json 稳定 NUL 文本，NULL/空串表示空列表，拒绝解码 NUL 和尾垃圾。
+ * @param[out] out_parts 非 NULL 新/已清理包装，先初始化，失败归还全部已追加内容。
+ * @return 成功为 CC_OK，空输出为 INVALID_ARGUMENT，损坏/schema/通用解析失败为 JSON，字段/列表分配失败为 OUT_OF_MEMORY。
+ * @note 单个大小写键、缺失可选值、未知字符串默认及旧平铺媒体形式继续接受，原文不修改。
  */
 cc_result_t cc_content_parts_from_json(const char *json, cc_content_parts_t *out_parts)
 {
@@ -798,17 +954,44 @@ cc_result_t cc_content_parts_from_json(const char *json, cc_content_parts_t *out
     }
     cc_content_parts_init(out_parts);
     if (!json || !*json) return cc_result_ok();
+    if (cc_storage_json_has_nul_escape(json))
+        return cc_result_error(CC_ERR_JSON, "Content parts JSON contains a decoded NUL");
     cc_json_value_t *root = NULL;
-    cc_result_t rc = cc_json_parse(json, &root);
+    cc_result_t rc = cc_json_parse_strict(json, &root);
     if (rc.code != CC_OK) return rc;
     if (!cc_json_is_array(root)) {
         cc_json_destroy(root);
         return cc_result_error(CC_ERR_JSON, "Content parts JSON must be an array");
     }
+    cc_result_free(&rc);
     int n = cc_json_array_size(root);
-    for (int i = 0; i < n; i++) {
-        cc_json_value_t *obj = cc_json_array_get(root, i);
-        if (!obj || !cc_json_is_object(obj)) continue;
+    int index = 0;
+    cc_result_t error;
+    for (; index < n; index++) {
+        cc_json_value_t *obj = cc_json_array_get(root, index);
+        if (!obj || !cc_json_is_object(obj)) {
+            rc = cc_result_error(CC_ERR_JSON, "Content part must be an object");
+            goto fail;
+        }
+        static const char *const fields[] = {"type", "direction", "text", "artifact"};
+        const char *duplicate = cc_json_duplicate_known_field(obj, fields, sizeof(fields) / sizeof(fields[0]));
+        if (duplicate) {
+            rc = cc_result_errf(CC_ERR_JSON, "Duplicate content field '%s'", duplicate);
+            goto fail;
+        }
+        static const char *const string_fields[] = {"type", "direction", "text"};
+        for (size_t field = 0; field < sizeof(string_fields) / sizeof(string_fields[0]); field++) {
+            cc_json_value_t *value = cc_json_object_get(obj, string_fields[field]);
+            if (value && !cc_json_is_string(value)) {
+                rc = cc_result_errf(CC_ERR_JSON, "Content field '%s' must be a string", string_fields[field]);
+                goto fail;
+            }
+        }
+        cc_json_value_t *artifact_obj = cc_json_object_get(obj, "artifact");
+        if (artifact_obj && !cc_json_is_object(artifact_obj)) {
+            rc = cc_result_error(CC_ERR_JSON, "Content field 'artifact' must be an object");
+            goto fail;
+        }
         cc_media_kind_t kind = cc_media_kind_from_string(
             cc_json_string_value(cc_json_object_get(obj, "type")));
         const char *dir_s = cc_json_string_value(cc_json_object_get(obj, "direction"));
@@ -821,40 +1004,47 @@ cc_result_t cc_content_parts_from_json(const char *json, cc_content_parts_t *out
                 dir);
         } else {
             cc_media_artifact_t artifact;
-            cc_json_value_t *artifact_obj = cc_json_object_get(obj, "artifact");
             if (!artifact_obj) artifact_obj = obj;
             rc = artifact_from_json_object(artifact_obj, &artifact);
             if (rc.code == CC_OK) {
                 artifact.kind = kind;
+                cc_result_free(&rc);
                 rc = cc_content_parts_append_artifact(out_parts, &artifact, dir);
                 cc_media_artifact_cleanup(&artifact);
             }
         }
-        if (rc.code != CC_OK) {
-            cc_json_destroy(root);
-            cc_content_parts_cleanup(out_parts);
-            return rc;
-        }
+        if (rc.code != CC_OK) goto fail;
+        cc_result_free(&rc);
     }
     cc_json_destroy(root);
     return cc_result_ok();
+fail:
+    error = cc_result_errf(rc.code, "Content part[%d]: %s", index,
+        rc.message ? rc.message : "invalid content part");
+    cc_result_free(&rc);
+    cc_json_destroy(root);
+    cc_content_parts_cleanup(out_parts);
+    return error;
 }
 
-/*
- * 生成 content parts 的文本摘要。
- *
- * 文本 part 保留原文，artifact part 生成带 kind/id/mime 的占位符。这个函数常用于
- * memory 检索摘要或不支持多模态 provider 的降级输入。
+/**
+ * @brief 拼接原始文本和媒体占位符，项间加入换行。
+ * @param[in] parts 非 NULL 稳定只读列表，items 覆盖 count。
+ * @param[out] out_summary 非 NULL 独立输出槽，先置 NULL，成功接管 free 可释放缓冲。
+ * @return 成功为 CC_OK，参数/形状错误为 INVALID_ARGUMENT，构造失败交付首个拥有错误并释放 builder。
+ * @note 无内部锁，所有源字段借用覆盖构造期，输出槽不得覆盖输入字段。
  */
 cc_result_t cc_content_parts_text_summary(
     const cc_content_parts_t *parts,
     char **out_summary
 )
 {
-    if (!parts || !out_summary) {
+    if (!out_summary) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null content summary argument");
     }
     *out_summary = NULL;
+    if (!parts || parts->count > SIZE_MAX / sizeof(*parts->items) || (parts->count && !parts->items))
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid content summary parts");
     cc_string_builder_t sb;
     cc_result_t rc = cc_string_builder_init(&sb);
     if (rc.code != CC_OK) return rc;

@@ -9,6 +9,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* cancel token 前置声明，HTTP port 只借用指针以支持请求取消。 */
 typedef struct cc_cancel_token cc_cancel_token_t;
 typedef struct cc_http_client cc_http_client_t;
@@ -22,7 +26,23 @@ enum {
     CC_HTTP_CAP_RESOLVED_ADDRESS_VALIDATION = 1ULL << 4,
 };
 
+/**
+ * @brief 在平台访问 URL 前同步决定是否允许该地址。
+ * @param[in] url 回调期间借用的完整 NUL 结尾地址。
+ * @param[in,out] user_data 借用调用者状态，须在整个 perform 期间有效。
+ * @return 非零允许，零拒绝，函数须在返回前结束对 url 的访问。
+ * @note 回调运行于 perform 调用线程，其共享状态由调用者同步。
+ */
 typedef int (*cc_http_url_validator_fn)(const char *url, void *user_data);
+
+/**
+ * @brief 同步检查平台解析出的候选地址或已连接对端。
+ * @param[in] host 回调期间借用的原主机名。
+ * @param[in] numeric_address 回调期间借用的数字 IP 字符串。
+ * @param[in,out] user_data 借用调用者状态，须在 perform 期间有效。
+ * @return 非零允许，零拒绝，结束时归还所有借用。
+ * @note 具体检查点由端口能力决定，回调共享状态须外层同步。
+ */
 typedef int (*cc_http_address_validator_fn)(
     const char *host,
     const char *numeric_address,
@@ -41,11 +61,13 @@ typedef struct cc_http_header {
     const char *value;
 } cc_http_header_t;
 
-/*
- * 流式 body 回调。
- *
- * data 只在回调期间有效；返回非 OK 表示停止接收并把错误传回 HTTP 调用方。平台实现
- * 应遵守 max_response_bytes 和 cancel_token，避免大响应耗尽内存。
+/**
+ * @brief 同步消费平台交付的一段响应正文。
+ * @param[in] data 回调期间借用的 len 字节，无 NUL 终止保证，零长度时可为 NULL。
+ * @param[in] len 本片段可读取的字节数。
+ * @param[in,out] user_data perform 期间借用的调用者状态。
+ * @return 结果的拥有权交给端口，包括 CC_OK 携带的动态消息；错误用于停止接收并传回调用者。
+ * @note 片段边界由端口决定。ESP32 在连接池锁内回调，回调内重入 perform、reset 或 destroy 可能死锁。
  */
 typedef cc_result_t (*cc_http_body_callback_fn)(
     const char *data,
@@ -53,13 +75,13 @@ typedef cc_result_t (*cc_http_body_callback_fn)(
     void *user_data
 );
 
-/* 单次 HTTP 重试的耗时指标；由 provider adapter 填充，供观测和诊断使用。 */
+/* 单次 HTTP 尝试的端口观测，未支持或尚未观测的字段由各端口约定。 */
 typedef struct cc_http_attempt_metrics {
     size_t size;           /**< 结构体大小 */
-    const char *stage;     /**< 请求阶段名（dns/connect/tls/send/wait） */
+    const char *stage;     /**< 回调期间借用的请求阶段名 */
     const char *err;       /**< 错误描述，成功时为 NULL */
     long status;           /**< HTTP 状态码 */
-    int attempt_id;        /**< 本次尝试唯一 id */
+    int attempt_id;        /**< 端口生成的本次尝试标识 */
     int attempt_index;     /**< 重试序号（从 0 开始） */
     int final_attempt;     /**< 是否为最后一次尝试 */
     int total_ms;          /**< 从请求开始到本次尝试结束的毫秒数 */
@@ -81,7 +103,13 @@ typedef struct cc_http_attempt_metrics {
     int saw_done;          /**< 观测回调触发时上层协议是否已报告完整结束 */
 } cc_http_attempt_metrics_t;
 
-/* HTTP 重试指标回调；metrics 只在回调期间有效。 */
+/**
+ * @brief 在一次尝试结束时同步接收端口观测。
+ * @param[in] metrics 回调期间借用的指标对象及其中字符串，后续使用须复制。
+ * @param[in,out] user_data perform 期间借用的调用者状态，其共享访问须自行同步。
+ * @post 不转移任何资源，返回前结束对 metrics 的访问。
+ * @note ESP32 可在连接池锁内回调，禁止同步重入该客户端的 perform、reset 或 destroy。
+ */
 typedef void (*cc_http_attempt_metrics_callback_fn)(
     const cc_http_attempt_metrics_t *metrics,
     void *user_data
@@ -90,7 +118,9 @@ typedef void (*cc_http_attempt_metrics_callback_fn)(
 /*
  * HTTP 请求描述。
  *
- * 所有字符串和 header 数组都是借用指针，只需在 cc_http_client_perform() 调用期间有效。
+ * 所有字符串、header 数组、取消令牌和回调状态均借用至 perform 返回。
+ * body 是 NUL 结尾字符串，当前请求接口未提供二进制正文长度。
+ * header_count 非零时 headers 须指向足够数量的有效元素。
  * 如果 on_body 非 NULL，平台实现可以流式回调 body；否则通常把响应体放入 out_response。
  * 自动 redirect 必须重新校验 network allowlist，不能绕过 SDK 安全策略。
  */
@@ -116,7 +146,7 @@ typedef struct cc_http_request {
 
     long idle_timeout_ms;
 
-    int retry_count;
+    int retry_count; /**< 正数覆盖客户端重试次数，零继承客户端配置，负数明确禁止重试。 */
 
     size_t max_response_bytes;
 
@@ -130,29 +160,29 @@ typedef struct cc_http_request {
 
     cc_cancel_token_t *cancel_token;
 
-    /* Absolute monotonic deadline. Zero means derive one from timeout_ms. */
+    /* 与 cc_platform_monotonic_ms 同一启动时间域的绝对截止时间，非零时进一步收紧总请求预算。 */
     uint64_t deadline_ms;
 
-    /* Rechecked for the initial URL and every redirect hop. */
+    /* 初始 URL 及支持自动跳转的每一跳同步校验。 */
     cc_http_url_validator_fn validate_url;
     void *validate_url_user_data;
 
-    /* Called for every resolved candidate and the connected peer when supported. */
+    /* 端口支持时检查全部解析候选及连接对端，参见 capabilities。 */
     cc_http_address_validator_fn validate_address;
     void *validate_address_user_data;
 
     size_t max_redirects;
 
     /*
-     * Optional platform reuse controls. NULL keeps the platform default.
-     * ESP32 uses these to isolate LLM stream/sync/local handles while
-     * retaining keep-alive reuse inside each pool.
+     * 可选连接池选择，NULL 采用平台默认值。ESP32 隔离模型流式、同步与本地连接。
+     * 名称按端口规则选择已有池，字符串只借用至 perform 返回。
      */
     const char *connection_pool;
 
     /*
-     * 不含敏感 header value 的请求形状指纹。ESP32 用它隔离 handle 级 header 状态；
-     * 调用方应在 method 或 header 名集合变化时提供不同值，NULL 视为独立的默认形状。
+     * 不包含 header value 的请求形状指纹，用于 ESP32 的复用兼容性判断。
+     * method 或 header 名集合变化时应采用不同值，NULL 采用端口默认形状。
+     * 每次请求仍须提交全部 header，平台会重新安装本次字段。
      */
     const char *header_profile;
 } cc_http_request_t;
@@ -177,7 +207,7 @@ typedef struct cc_http_response {
     size_t body_size;
 } cc_http_response_t;
 
-/* HTTP 客户端实例选项。创建后只属于该实例，不影响其它 runtime。 */
+/* 客户端创建时复制的值选项。size 是描述字段，当前端口按本版本完整结构读取。 */
 typedef struct cc_http_client_options {
     size_t size;              /**< 结构体大小 */
     int tls_verify;           /**< 是否验证 TLS 证书 */
@@ -190,14 +220,35 @@ typedef struct cc_http_client_options {
 } cc_http_client_options_t;
 
 struct cc_http_client_vtable {
+    /**
+     * @brief 同步执行请求并在返回前结束全部回调。
+     * @param[in,out] self 借用的存活平台实例，拥有者保证调用期间不会销毁。
+     * @param[in] request 借用且稳定的请求及关联资源。
+     * @param[out] out_response 接收平台拥有响应资源，调用前为空，错误后也须按端口约定清理。
+     * @return 拥有结果，调用者释放消息，HTTP 状态码保存在响应内。
+     * @note 并发能力由端口提供，ESP32 按池串行，curl 每次调用独立持有传输资源。
+     */
     cc_result_t (*perform)(
         void *self,
         const cc_http_request_t *request,
         cc_http_response_t *out_response);
+    /**
+     * @brief 同步丢弃缓存连接，未缓存连接的端口允许空操作。
+     * @param[in,out] self 借用存活实例，拥有者保证不会并发销毁。
+     * @return 拥有结果，调用者释放，ESP32 等待相关连接池锁后执行重置。
+     * @note 允许的并发由端口约定，回调内同步重入可能阻塞自身。
+     */
     cc_result_t (*reset_connections)(void *self);
+    /**
+     * @brief 释放已停止接收调用的平台实例及缓存连接。
+     * @param[in,out] self 被消费的平台实例。
+     * @pre 拥有者已关闭入口，等待全部已接纳 perform、reset 及其回调返回。
+     * @post 实例已失效，禁止再经其别名发起调用，函数不提供独立的调用排空屏障。
+     */
     void (*destroy)(void *self);
 };
 
+/* 拥有平台 self 的描述符，复制结构仅产生别名，销毁和并发准入由唯一拥有者协调。 */
 struct cc_http_client {
     void *self;
     const cc_http_client_vtable_t *vtable;
@@ -205,15 +256,24 @@ struct cc_http_client {
     uint64_t capabilities;
 };
 
+/**
+ * @brief 创建当前构建所选平台的 HTTP 客户端。
+ * @param[in] options 调用期间借用的完整本版本选项，NULL 使用端口默认值。
+ * @param[out] out_client 空描述符输出槽，成功后调用者负责关闭入口、排空并销毁。
+ * @return 成功为 CC_OK，失败返回拥有错误消息的结果，由调用者释放。
+ * @note 创建不同实例可并发，具体能力和默认超时取决于已编入的平台实现。
+ */
 cc_result_t cc_http_client_create_default(
     const cc_http_client_options_t *options,
     cc_http_client_t *out_client);
 
-/*
- * 执行 HTTP 请求。
- *
- * 这是平台 port 的统一入口，POSIX/Windows/ESP32/FreeRTOS 可分别实现。错误应映射为
- * CC_ERR_NETWORK、CC_ERR_TIMEOUT、CC_ERR_CANCELLED、CC_ERR_LIMIT_EXCEEDED 等稳定结果。
+/**
+ * @brief 检查描述符后同步转发平台 HTTP 请求。
+ * @param[in,out] client 借用的存活描述符，拥有者保证整个调用期间不会销毁或改写。
+ * @param[in] request 借用请求，字段校验和阶段预算由平台实现负责。
+ * @param[out] out_response 接收响应资源的空槽，调用者最终 cc_http_response_free。
+ * @return 拥有结果，由调用者释放，描述符无效时返回参数错误且不访问输出槽。
+ * @note 包装层不增加锁、后台线程或销毁屏障。取消、流式和连接池能力参见端口描述符。
  */
 static inline cc_result_t cc_http_client_perform(
     cc_http_client_t *client,
@@ -227,7 +287,12 @@ static inline cc_result_t cc_http_client_perform(
     return client->vtable->perform(client->self, request, out_response);
 }
 
-/* 重置缓存的持久 HTTP/TLS 连接句柄，Wi-Fi 断开后调用可避免重用无效连接。 */
+/**
+ * @brief 检查描述符后同步重置平台缓存连接。
+ * @param[in,out] client 借用的存活描述符，拥有者保证调用期间不会销毁。
+ * @return 平台拥有结果，调用者释放，缺少重置入口时返回参数错误。
+ * @note ESP32 等待池锁，curl 为无缓存空操作；禁止在持有同一池的回调内同步调用。
+ */
 static inline cc_result_t cc_http_client_reset_connections(cc_http_client_t *client)
 {
     if (!client || !client->vtable || !client->vtable->reset_connections) {
@@ -236,6 +301,13 @@ static inline cc_result_t cc_http_client_reset_connections(cc_http_client_t *cli
     return client->vtable->reset_connections(client->self);
 }
 
+/**
+ * @brief 消费平台实例并清零客户端描述符。
+ * @param[in,out] client 唯一拥有的描述符，可为 NULL，空描述符允许重复销毁。
+ * @pre 拥有者已关闭入口，并等待所有已接纳 API 调用及回调完全返回。
+ * @post 描述符清零，其原 self 和所有别名均失效，禁止继续调用。
+ * @note 不与 perform、reset 或描述符读写并发，排空由 SDK 外层拥有者或自定义拥有者负责。
+ */
 static inline void cc_http_client_destroy(cc_http_client_t *client)
 {
     if (!client) return;
@@ -246,7 +318,16 @@ static inline void cc_http_client_destroy(cc_http_client_t *client)
     client->capabilities = 0;
 }
 
-/* 释放 HTTP 响应拥有的 headers/body；不释放 response 指针本身。 */
+/**
+ * @brief 释放响应拥有的 header 数组、字段字符串及正文，然后清零响应。
+ * @param[in,out] response 独占响应，可为 NULL，空响应允许重复清理。
+ * @post 非空响应已清零，原字段借用全部失效，response 结构本身仍归调用者。
+ * @note 须在 perform 返回及所有正文使用者结束后调用，禁止并发读写同一响应。
+ */
 void cc_http_response_free(cc_http_response_t *response);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

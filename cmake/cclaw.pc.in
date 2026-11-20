@@ -1,10 +1,13 @@
-prefix=@CMAKE_INSTALL_PREFIX@
+prefix=${pcfiledir}/@CCLAW_PC_PREFIX_RELATIVE@
 exec_prefix=${prefix}
-libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
-includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+libdir=@CCLAW_PC_LIBDIR@
+includedir=@CCLAW_PC_INCLUDEDIR@
 
 Name: C-Claw
 Description: Pure C agent runtime SDK
 Version: @CCLAW_VERSION@
 Libs: -L${libdir} -lc_claw_runtime
+Libs.private: @CCLAW_PC_LIBS_PRIVATE@
+Requires.private: @CCLAW_PC_REQUIRES_PRIVATE@
 Cflags: -I${includedir}
+# 安装位置由 pcfiledir 推导，静态依赖只包含本次构建实际需要的库。

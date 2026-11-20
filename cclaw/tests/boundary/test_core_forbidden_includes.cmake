@@ -20,3 +20,7 @@ foreach(path IN LISTS core_files)
         message(FATAL_ERROR "SDK core has forbidden ESP/platform-specific token in ${path}: ${token_match}")
     endif()
 endforeach()
+#[[
+  @file 以 CCLAW_SOURCE_DIR 为只读根扫描 core 的 C/H 包含文本，拒绝平台层依赖。
+  缺失输入或命中禁止规则时终止脚本，扫描列表与文件内容只在本次 CMake 进程存活。
+]]

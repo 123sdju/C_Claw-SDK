@@ -7,6 +7,9 @@
 
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /*
  * SDK 统一错误码。
@@ -49,8 +52,8 @@ typedef enum cc_error_code {
 /*
  * 结构化错误细节。
  *
- * size 用于后续 ABI 扩展；调用方创建该结构时应使用 {0} 初始化并设置 size。
- * 字符串字段由结构体拥有，复制到 cc_result_t 后由 cc_result_free() 释放。
+ * 调用方创建该结构时使用 {0} 初始化并设置 size。当前接口按完整的当前布局访问字段。
+ * 清理时由结构体拥有字符串，构造 result 时深拷贝输入字符串，双方分别管理自己的资源。
  * HTTP provider 会用 http_status、retry_after_ms、recoverable 和 raw_redacted_body
  * 向上层暴露恢复语义，但 SDK 不在内部自动 retry。
  */
@@ -77,20 +80,37 @@ typedef struct cc_result {
     cc_error_detail_t *detail;
 } cc_result_t;
 
-/* 构造成功结果；返回值仍可安全传给 cc_result_free()。 */
+/**
+ * @brief 构造无动态成员的成功结果。
+ * @return 按值返回 CC_OK、当前 size 及空动态成员，可传给 cc_result_free。
+ */
 cc_result_t cc_result_ok(void);
 
-/* 构造普通错误；message 会被深拷贝，调用方仍拥有传入字符串。 */
+/**
+ * @brief 构造保存指定 code 的结果，并复制可选描述。
+ * @param[in] code 要保存的状态码。
+ * @param[in] message 调用期间借用的描述，允许 NULL。
+ * @return 动态成员由调用者 cc_result_free，描述复制失败时 message 为空、code 保持。
+ */
 cc_result_t cc_result_error(cc_error_code_t code, const char *message);
 
-/* 按 printf 风格构造错误 message；失败时 message 可能为空，但 code 保持传入值。 */
+/**
+ * @brief 按 printf 格式构造拥有的错误描述。
+ * @param[in] code 要保存的状态码。
+ * @param[in] fmt 同步借用的格式串，允许 NULL。
+ * @param[in] ... 与格式串匹配的参数，引用数据须覆盖两次格式化。
+ * @return 按值返回结果，由调用者 cc_result_free。格式化或分配失败时 message 为空，
+ *         code 保持输入值。
+ */
 cc_result_t cc_result_errf(cc_error_code_t code, const char *fmt, ...);
 
-/*
- * 构造带结构化 detail 的错误。
- *
- * detail 会被深拷贝，调用方可在返回后立即清理自己的 detail。适合 provider、HTTP、
- * storage 等需要把机器可读元数据交给上层恢复策略的场景。
+/**
+ * @brief 深拷贝描述与可选的结构化错误详情。
+ * @param[in] code 输入状态码，详情分配失败时返回 OUT_OF_MEMORY。
+ * @param[in] message 调用期间借用的可选描述。
+ * @param[in] detail 调用期间借用的完整当前布局详情，允许 NULL。
+ * @return 拥有动态成员的按值结果，由调用者 cc_result_free，输入资源仍归调用者。
+ *         详情复制失败时回收本次已分配资源，描述复制失败沿用普通错误构造的语义。
  */
 cc_result_t cc_result_with_detail(
     cc_error_code_t code,
@@ -98,16 +118,37 @@ cc_result_t cc_result_with_detail(
     const cc_error_detail_t *detail
 );
 
-/* 释放 result 内部拥有的 message/detail，并把指针字段清空；不会释放 result 本身。 */
+/**
+ * @brief 释放结果独占的动态成员。
+ * @param[in,out] result 已初始化且独占的结果，允许 NULL。
+ * @post message 和 detail 置空，code、size 和结构体存储保留，可再次清理。
+ * @note 按值复制包含动态成员的结果时，调用者须明确交接唯一释放责任。
+ */
 void cc_result_free(cc_result_t *result);
 
-/* 释放 detail 内部拥有的字符串字段；不会释放 detail 本身。 */
+/**
+ * @brief 释放错误详情拥有的三个字符串。
+ * @param[in,out] detail 已初始化且独占的详情，允许 NULL，字符串须可 free。
+ * @post 非空详情全部归零，结构体存储继续由调用者管理。
+ */
 void cc_error_detail_cleanup(cc_error_detail_t *detail);
 
-/* 返回适合展示的错误描述，字符串为静态常量，调用方不要 free。 */
+/**
+ * @brief 查询用于日志和展示的英文错误描述。
+ * @param[in] code 状态码，允许未知枚举值。
+ * @return 进程期有效的只读静态文本，未知值返回 Unknown。
+ */
 const char *cc_error_string(cc_error_code_t code);
 
-/* 返回稳定错误码名字，适合 observability、日志和机器解析。 */
+/**
+ * @brief 查询错误码的机器可读符号名。
+ * @param[in] code 状态码，允许未知枚举值。
+ * @return 进程期有效的只读静态文本，未知值返回 CC_ERR_UNKNOWN。
+ */
 const char *cc_error_code_name(cc_error_code_t code);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

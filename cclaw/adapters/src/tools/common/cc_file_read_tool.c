@@ -6,41 +6,35 @@
 #include "cc/ports/cc_tool.h"
 #include "cc/ports/cc_filesystem.h"
 #include "cc/util/cc_json.h"
+#include "cc/internal/cc_json_fields.h"
+#include "cc/internal/cc_json_syntax_check.h"
 #include "cc/internal/cc_alloc.h"
 #include <stdlib.h>
 #include <string.h>
 
 /*
- * file_read 工具的私有对象。
- *
- * 工具只保存 filesystem 端口的值拷贝，不拥有 filesystem self；具体平台文件系统由
- * runtime builder 统一管理。这样同一个工具实现可以运行在 POSIX、内存文件系统或 MCU
- * 适配层上。
+ * file_read 私有状态只保存 filesystem 的浅拷贝，创建者保持其 self/vtable
+ * 覆盖工具调用期，工具销毁仅释放本状态。根目录约束由 read_relative_text 实现。
  */
 typedef struct {
     cc_filesystem_t fs;
 } cc_file_read_tool_t;
 
-/* 返回工具注册名；registry/schema 生成和 LLM tool call 都依赖这个稳定名字。 */
+/** @brief 提供稳定注册名。 @param[in] self 忽略的状态借用，可为 NULL。 @return 静态只读名称，无释放责任。 */
 static const char *file_read_name(void *self)
 {
     (void)self;
     return "file_read";
 }
 
-/* 返回给模型和调试 UI 的简短说明；不分配内存，调用方不能释放返回值。 */
+/** @brief 提供读取说明。 @param[in] self 忽略的状态借用，可为 NULL。 @return 静态只读描述。 */
 static const char *file_read_description(void *self)
 {
     (void)self;
     return "Read the contents of a file";
 }
 
-/*
- * 返回工具参数 JSON Schema。
- *
- * core tool executor 会在执行前做最小 schema 校验；因此这里声明 path 必填且为 string，
- * 可以在进入文件系统前拦截明显错误参数。
- */
+/** @brief 声明必填字符串 path。 @param[in] self 忽略的状态借用，可为 NULL。 @return 静态 JSON Schema 对象文本，调用者只读借用。 */
 static const char *file_read_schema_json(void *self)
 {
     (void)self;
@@ -53,13 +47,16 @@ static const char *file_read_schema_json(void *self)
     "}";
 }
 
-/*
- * 执行文件读取。
- *
- * args_json 由 runtime 传入，out_result 由本函数填充；业务失败（JSON 错误、路径越界、
- * 文件读取失败）都通过 out_result->ok=0 返回，cc_result 仍为 OK，表示 agent 可以恢复
- * 并把错误作为 tool observation 反馈给模型。路径先拼接 workspace，再做边界检查，防止
- * `../` 等越权读取。
+/**
+ * @brief 严格校验读取参数，再委托具有根目录约束的文本入口。
+ * @param[in] self 必填存活工具状态借用，文件系统 owner 覆盖整个同步调用。
+ * @param[in] args_json 调用期稳定参数文本，须为完整对象，path 为单个字符串字段。
+ * @param[in] ctx 调用期上下文借用，缺少 workspace_dir 作为业务失败反馈。
+ * @param[out] out_result 必填新建或已 cleanup 槽，先清零，成功正文或错误副本交调用者 cleanup。
+ * @return 参数地址错误为 INVALID_ARGUMENT，结果副本 OOM 为 OUT_OF_MEMORY，其他业务失败以 CC_OK 和 ok=0 返回，诊断由调用者释放。
+ * @note 路径检查及链接规则沿后端，失败可能已有部分读取缓冲并在本函数归还。
+ * 不保留上下文，也不自行截取 max_result_bytes，完整文件读取后由 executor 检查输出预算。
+ * 并发文件访问由后端及业务同步，销毁前 owner 排空调用。
  */
 static cc_result_t file_read_call(
     void *self,
@@ -68,62 +65,68 @@ static cc_result_t file_read_call(
     cc_tool_result_t *out_result
 )
 {
-    cc_file_read_tool_t *tool = (cc_file_read_tool_t *)self;
-
+    if (!out_result) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null file read result");
     memset(out_result, 0, sizeof(cc_tool_result_t));
-
-    const char *path = NULL;
+    if (!self) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null file read tool");
+    cc_file_read_tool_t *tool = (cc_file_read_tool_t *)self;
+    const char *error = "Failed to parse arguments JSON";
     cc_json_value_t *args = NULL;
-    cc_result_t rc = cc_json_parse(args_json, &args);
-    if (rc.code != CC_OK) {
-        out_result->ok = 0;
-        out_result->error = cc_copy_string("Failed to parse arguments JSON");
-        return cc_result_ok();
+    char *content = NULL;
+    cc_result_t rc = cc_result_ok();
+    if (!args_json || cc_storage_json_has_nul_escape(args_json)) goto error;
+    rc = cc_json_parse_strict(args_json, &args);
+    if (rc.code != CC_OK) goto error;
+    const char *fields[] = {"path"};
+    if (!cc_json_is_object(args) || cc_json_duplicate_known_field(args, fields, 1)) {
+        error = "Arguments must be an object with one path field";
+        goto error;
     }
-
     cc_json_value_t *path_val = cc_json_object_get(args, "path");
-    path = cc_json_string_value(path_val);
-
+    const char *path = cc_json_string_value(path_val);
     if (!path) {
-        out_result->ok = 0;
-        out_result->error = cc_copy_string("Missing required parameter: path");
-        cc_json_destroy(args);
-        return cc_result_ok();
+        error = "Missing required string parameter: path";
+        goto error;
     }
-
     if (!ctx || !ctx->workspace_dir ||
+        !tool->fs.vtable ||
         !(tool->fs.capabilities & CC_FS_CAP_ROOT_SCOPED) ||
         !tool->fs.vtable->read_relative_text) {
-        out_result->ok = 0;
-        out_result->error = cc_copy_string("Filesystem does not support root-scoped reads");
-        cc_json_destroy(args);
-        return cc_result_ok();
+        error = "Filesystem does not support root-scoped reads";
+        goto error;
     }
-
-    char *content = NULL;
+    cc_result_free(&rc);
     rc = tool->fs.vtable->read_relative_text(
         tool->fs.self, ctx->workspace_dir, path, &content);
-    cc_json_destroy(args);
-
     if (rc.code != CC_OK) {
-        out_result->ok = 0;
-        out_result->error = cc_copy_string(rc.message ? rc.message : "Failed to read file");
-        cc_result_free(&rc);
-        return cc_result_ok();
+        error = rc.message ? rc.message : "Failed to read file";
+        goto error;
     }
-
+    if (!content) {
+        error = "Filesystem returned no file content";
+        goto error;
+    }
+    cc_json_destroy(args);
+    cc_result_free(&rc);
     out_result->ok = 1;
     out_result->text = content;
     return cc_result_ok();
+
+error:
+    out_result->error = cc_copy_string(error);
+    cc_json_destroy(args);
+    free(content);
+    cc_result_free(&rc);
+    return out_result->error ? cc_result_ok() :
+        cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to allocate file read error");
 }
 
-/* 销毁 file_read 工具私有对象；filesystem 端口本身不在这里销毁。 */
+/** @brief 消费读取工具状态。 @param[in,out] self 独占堆状态，可为 NULL。 @pre owner 已关闭入口并排空调用。 @post 状态释放，借用的 filesystem 由其 owner 继续管理。 */
 static void file_read_destroy(void *self)
 {
     free(self);
 }
 
-/* file_read 的 vtable，把 C 函数集合包装成面向对象风格的工具接口。 */
+/* 静态方法表在工具整个生命周期内保持有效。 */
 static cc_tool_vtable_t file_read_vtable = {
     file_read_name,
     file_read_description,
@@ -132,11 +135,11 @@ static cc_tool_vtable_t file_read_vtable = {
     file_read_destroy
 };
 
-/*
- * 创建 file_read 工具实例。
- *
- * 成功后 out_tool 获得 self/vtable，后续由 tool registry/runtime 调用 destroy 释放 self。
- * fs 是端口值拷贝，必须在工具生命周期内保持其 self/vtable 有效。
+/**
+ * @brief 创建借用文件系统的读取工具，不探测后端能力。
+ * @param[in] fs 浅拷贝端口，创建者保持 self/vtable 覆盖后续调用，缺少根约束支持在 call 反馈。
+ * @param[out] out_tool 必填空描述符，先清零，成功交付拥有状态和静态方法表。
+ * @return 参数或 OOM 错误，失败无新状态，成功由调用者 destroy 或成功转交 registry，诊断由调用者释放。
  */
 cc_result_t cc_file_read_tool_create(cc_filesystem_t fs, cc_tool_t *out_tool)
 {

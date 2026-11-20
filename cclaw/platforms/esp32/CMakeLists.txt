@@ -65,3 +65,8 @@ if(ESP_PLATFORM)
             PARENT_SCOPE)
     endif()
 endif()
+#[[
+  @file 组装 ESP-IDF 平台对象并关联原生组件目标。
+  libc 目标随实际 IDF 环境选择，HTTP 功能开启后追加 native HTTP、网络和 TLS 依赖。
+  本目录要求父工程已初始化 IDF，组件对象和原生组件均由该构建树管理。
+]]
