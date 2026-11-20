@@ -18,40 +18,42 @@
 #include <stdio.h>
 #include <string.h>
 
-/* runtime builder 最多记录的诊断条数；超过后设置 truncated，避免动态扩容。 */
+/** @brief 诊断集合的固定条数上限，超限只标记 truncated，保持已有条目。 */
 #define CC_RUNTIME_DIAGNOSTICS_MAX 32
 
-/*
- * 单条 runtime 构建诊断。
- *
- * 使用固定长度数组是为了让配置加载失败时不再依赖额外堆内存；kind/id/message 用于
- * 说明哪个 provider/tool/plugin 缺失或不可用。
- */
+/** @brief 按值拥有的构建诊断，各字段按字节截断并保证 NUL 结尾。 */
 typedef struct cc_runtime_diagnostic {
-    char kind[24];
-    char id[80];
-    char message[192];
+    char kind[24]; /**< 组件分类，包含结尾 NUL 的容量为 24 字节。 */
+    char id[80]; /**< 组件标识，包含结尾 NUL 的容量为 80 字节。 */
+    char message[192]; /**< 诊断文本，包含结尾 NUL 的容量为 192 字节。 */
 } cc_runtime_diagnostic_t;
 
-/* runtime 构建诊断集合；由 builder 填充，调用方只读。 */
+/** @brief 拥有固定条目数组的诊断集合，读写由当前拥有者串行化。 */
 typedef struct cc_runtime_diagnostics {
-    cc_runtime_diagnostic_t items[CC_RUNTIME_DIAGNOSTICS_MAX];
-    size_t count;
-    int truncated;
+    cc_runtime_diagnostic_t items[CC_RUNTIME_DIAGNOSTICS_MAX]; /**< 按值条目，无动态资源。 */
+    size_t count; /**< 已填写条数，正常初始化后不超过固定容量。 */
+    int truncated; /**< 容量用尽后仍尝试追加时置一，字段文本本身的截断不设置此标志。 */
 } cc_runtime_diagnostics_t;
 
-/* 清空诊断集合；inline 是为了 public header 中轻量复用。 */
+/**
+ * @brief 清空全部诊断条目、计数和集合截断标志。
+ * @param[out] diagnostics 可为 NULL 的目标集合。
+ * @post 非 NULL 目标完全归零，旧条目借用结束；调用者排除并发访问。
+ */
 static inline void cc_runtime_diagnostics_reset(cc_runtime_diagnostics_t *diagnostics)
 {
     if (!diagnostics) return;
     memset(diagnostics, 0, sizeof(*diagnostics));
 }
 
-/*
- * 添加一条诊断。
- *
- * 超出固定容量时只设置 truncated，不分配更多内存。这是嵌入式友好的失败报告方式：
- * 保留前几条关键信息，同时不让错误报告本身造成 OOM。
+/**
+ * @brief 在固定数组追加一条文本诊断，集合满时标记截断。
+ * @param[in,out] diagnostics 已初始化的独占集合，可为 NULL 时跳过。
+ * @param[in] kind 调用期借用组件类别，NULL 使用 tool。
+ * @param[in] id 调用期借用标识，NULL 使用 (unknown)。
+ * @param[in] message 调用期借用诊断，NULL 使用 unavailable。
+ * @post 未满时复制文本并增加 count，已满时保持条目并置 truncated；复制超长字段按字节截断。
+ * @note 无动态分配，调用者负责串行化；输入文本须在各自复制期间可读且与本次写入槽不重叠。
  */
 static inline void cc_runtime_diagnostics_add(
     cc_runtime_diagnostics_t *diagnostics,
@@ -72,67 +74,107 @@ static inline void cc_runtime_diagnostics_add(
 }
 
 
-/* LLM provider factory；config 借用，out_provider 成功后由 runtime 管理。 */
+/**
+ * @brief 按配置创建一个由 builder generation 拥有的模型端口。
+ * @param[in] config 调用期间借用的配置，长期使用的字段由工厂复制。
+ * @param[in,out] http_client 借用 HTTP 端口及其接收者，覆盖 provider 的全部使用期。
+ * @param[out] out_provider 必填空槽，成功交付 self 和有效 vtable，归 generation 销毁。
+ * @return 工厂结果及拥有诊断；失败由工厂清理尚未交接的部分资源，调用者释放结果消息。
+ * @note 配置创建期间由调用者保持稳定，后续 provider 并发按其端口能力协调。
+ */
 typedef cc_result_t (*cc_runtime_llm_create_fn)(
     const cc_config_t *config,
     cc_http_client_t *http_client,
     cc_llm_provider_t *out_provider
 );
 
-/* session store factory；根据配置选择 JSON/SQLite/memory 等后端。 */
+/**
+ * @brief 创建跨 generation 共享的会话存储端口。
+ * @param[in] config 调用期间借用配置，工厂复制需长期使用的路径等字段。
+ * @param[out] out_store 必填空槽，成功交付拥有端口，由 builder 在全部使用者退出后销毁。
+ * @return 创建结果及拥有诊断；失败清理未交接资源，调用者释放结果消息。
+ */
 typedef cc_result_t (*cc_runtime_session_store_create_fn)(
     const cc_config_t *config,
     cc_session_store_t *out_store
 );
 
-/* memory store factory；可由下游替换为向量库/嵌入式 KV 存储。 */
+/**
+ * @brief 创建跨 generation 共享的长期记忆端口。
+ * @param[in] config 调用期间借用配置，需保留的内容由工厂复制。
+ * @param[out] out_store 必填空槽，成功交付拥有端口，builder 最终销毁。
+ * @return 创建结果及拥有诊断；失败须清理本次资源并保持空输出，builder 可记录诊断后继续无记忆装配。
+ */
 typedef cc_result_t (*cc_runtime_memory_store_create_fn)(
     const cc_config_t *config,
     cc_memory_store_t *out_store
 );
 
-/* policy engine factory；默认策略之外可以接入产品审批系统。 */
+/**
+ * @brief 创建供各代工具执行共同借用的策略端口。
+ * @param[in] config 调用期间借用配置，需保留的策略内容由工厂复制。
+ * @param[out] out_policy 必填空槽，成功交付由 builder 拥有并最终销毁的端口。
+ * @return 创建结果及拥有诊断，失败清理未交接资源，调用者释放结果消息。
+ */
 typedef cc_result_t (*cc_runtime_policy_create_fn)(
     const cc_config_t *config,
     cc_policy_engine_t *out_policy
 );
 
-/* sandbox factory；在支持进程的平台创建本地 sandbox，不支持时可返回 unsupported。 */
+/**
+ * @brief 创建由本次调用者保管的沙箱端口。
+ * @param[in] config 调用期间借用配置，需保留的字段由工厂复制。
+ * @param[out] out_sandbox 必填空槽，成功接收拥有沙箱，由接收者在使用者退出后销毁。
+ * @return 创建结果及拥有诊断，可返回 UNSUPPORTED；失败由工厂清理未交接资源。
+ * @note builder 可直接创建共享沙箱，也把此回调借给工具工厂，具体调用者承担成功资源的销毁。
+ */
 typedef cc_result_t (*cc_runtime_sandbox_create_fn)(
     const cc_config_t *config,
     cc_sandbox_t *out_sandbox
 );
 
-/*
- * tool factory 上下文。
- *
- * config/filesystem/memory_store/create_sandbox 都由 runtime builder 提供；工具 factory
- * 只在创建期间借用它们，不能把 ctx 指针保存到工具实例外部。
+/**
+ * @brief builder 在栈上提供的同步工具工厂上下文。
+ * @note ctx 地址及 out_capabilities 槽只覆盖 create 调用，长期字段由工厂复制。
+ * 工具可以按端口契约保存 filesystem 的按值借用及 HTTP/记忆借用，builder 保持这些底层资源到工具销毁。
  */
 typedef struct cc_runtime_tool_factory_ctx {
 
-    const cc_config_t *config;
+    const cc_config_t *config; /**< 同步配置借用，工具长期需要的字段须复制。 */
 
-    cc_filesystem_t filesystem;
+    cc_filesystem_t filesystem; /**< 按值借用文件系统端口，工具不接管底层 self。 */
 
-    cc_http_client_t *http_client;
+    cc_http_client_t *http_client; /**< 可选 HTTP 端口借用，需客户端的工厂自行校验能力。 */
 
-    cc_memory_store_t *memory_store;
+    cc_memory_store_t *memory_store; /**< 可选记忆端口借用，NULL 表示当前未装配。 */
 
-    cc_runtime_sandbox_create_fn create_sandbox;
+    cc_runtime_sandbox_create_fn create_sandbox; /**< 可选沙箱创建回调，成功资源由实际接收者销毁。 */
+
+    /* 本次调用可选能力输出，builder 初值为零；只有受信任工厂可声明，借用止于 create 返回。 */
+    unsigned *out_capabilities;
 } cc_runtime_tool_factory_ctx_t;
 
-/* tool factory；成功后 out_tool 通常注册到 registry 并由 registry 管理 self。 */
+/**
+ * @brief 从同步上下文创建供 registry 接管的独占工具。
+ * @param[in] ctx 调用期间借用的上下文，builder 提供有效地址，具体依赖可为空。
+ * @param[out] out_tool 必填空槽，成功移交 self/vtable；成功注册后 registry 拥有工具。
+ * @return 工厂结果及拥有诊断；失败须清理未发布工具并保持空输出。
+ * @note builder 对成功但空端口的结果跳过注册，self 非空而 vtable 为空会报告工厂契约错误。
+ * 成功工具注册失败时由 builder 清理，端口依赖继续借用至工具销毁。
+ */
 typedef cc_result_t (*cc_runtime_tool_create_fn)(
     const cc_runtime_tool_factory_ctx_t *ctx,
     cc_tool_t *out_tool
 );
 
-/*
- * plugin load 扩展点。
- *
- * SDK 核心不内置业务 plugin，只提供加载扩展点。out_state 由 loader 返回，runtime 销毁
- * 时交给 destroy_plugins；diagnostics 用于记录加载失败但可继续运行的原因。
+/**
+ * @brief 同步加载插件并把成功工具注册到未冻结 registry。
+ * @param[in] config 调用期间借用配置，运行态需保留内容由 loader 复制。
+ * @param[in,out] registry 借用注册表，注册成功后接管工具，工具可借用 loader 状态。
+ * @param[out] out_state 必填空槽，可交付完整或失败后的部分拥有状态，后续交 destroy_plugins。
+ * @param[in,out] diagnostics 可选独占诊断集合，loader 可记录组件问题。
+ * @return 结果与拥有诊断，错误时 builder 先销毁已注册工具，再调用对应状态析构。
+ * @note 非空状态须配对可用析构；编解码插件名称应复用 cc_tool_name_build，保持来源组件可逆与 lane 一致。
  */
 typedef cc_result_t (*cc_runtime_plugin_load_fn)(
     const cc_config_t *config,
@@ -141,10 +183,22 @@ typedef cc_result_t (*cc_runtime_plugin_load_fn)(
     cc_runtime_diagnostics_t *diagnostics
 );
 
-/* 销毁 plugin loader 返回的 state。 */
+/**
+ * @brief 消费插件 loader 交付的完整或部分状态。
+ * @param[in,out] state 拥有状态，允许 NULL，调用前借用该状态的工具已销毁、调用已退出。
+ * @post 状态及其拥有资源释放，原借用失效；builder 在各代清理中可用 NULL 调用。
+ */
 typedef void (*cc_runtime_plugin_destroy_fn)(void *state);
 
-/* MCP load 扩展点；语义同 plugin，但面向 MCP server/tool 注册。 */
+/**
+ * @brief 同步装配 MCP server 并向未冻结 registry 注册适配工具。
+ * @param[in] config 调用期间借用配置，运行态内容由 loader 复制。
+ * @param[in,out] registry 借用注册表，接管成功注册工具，工具可借用 MCP 状态。
+ * @param[out] out_state 必填空槽，可交付完整或部分拥有状态，后续交 destroy_mcp。
+ * @param[in,out] diagnostics 可选独占诊断集合，供追加 server 失败原因。
+ * @return 装配结果与拥有诊断；错误时 builder 先销毁已注册工具，再析构交付状态。
+ * @note 非空状态须有配对析构，成功后的并发调用遵循各传输与工具端口契约。
+ */
 typedef cc_result_t (*cc_runtime_mcp_load_fn)(
     const cc_config_t *config,
     cc_tool_registry_t *registry,
@@ -152,76 +206,69 @@ typedef cc_result_t (*cc_runtime_mcp_load_fn)(
     cc_runtime_diagnostics_t *diagnostics
 );
 
-/* 销毁 MCP loader 返回的 state。 */
+/**
+ * @brief 消费 MCP loader 交付的完整或部分连接状态。
+ * @param[in,out] state 拥有状态，允许 NULL，工具已销毁且所有在途请求已退出。
+ * @post 状态与拥有连接资源释放，原借用结束。
+ */
 typedef void (*cc_runtime_mcp_destroy_fn)(void *state);
 
-/*
- * provider 描述符。
- *
- * compiled 标识该 provider 是否进入当前 profile；create 为 NULL 或 compiled=0 时 builder
- * 应给出诊断而不是运行时崩溃。
- */
+/** @brief 只读 provider 描述符，名称、回调和数组均由 feature owner 保活。 */
 typedef struct cc_llm_provider_descriptor {
 
-    const char *name;
+    const char *name; /**< 配置使用的稳定名称，builder 跳过 NULL 名称。 */
 
-    int compiled;
+    int compiled; /**< 非零表示当前构建提供此能力，零时 builder 跳过。 */
 
-    cc_runtime_llm_create_fn create;
+    cc_runtime_llm_create_fn create; /**< 可选创建回调，NULL 时 builder 跳过。 */
 } cc_llm_provider_descriptor_t;
 
-/*
- * tool 描述符。
- *
- * name 是配置中使用的稳定名，alias 允许兼容简写；compiled 标识当前 profile 是否包含
- * 该工具实现。
- */
+/** @brief 只读工具描述符，供配置启用筛选及同步工厂装配。 */
 typedef struct cc_tool_descriptor {
 
-    const char *name;
+    const char *name; /**< 配置使用的稳定工具名，存活期覆盖 builder 和全部 generation。 */
 
-    const char *alias;
+    const char *alias; /**< 可选配置简写名称，NULL 表示无别名。 */
 
-    int compiled;
+    int compiled; /**< 非零表示工厂实现已进入本次构建。 */
 
-    cc_runtime_tool_create_fn create;
+    cc_runtime_tool_create_fn create; /**< 可选创建回调，compiled 为零或回调为空时跳过。 */
 } cc_tool_descriptor_t;
 
-/*
- * runtime feature set。
- *
- * 该结构把“当前构建包含哪些 provider/tool/storage/policy/plugin/MCP 扩展点”集中交给
- * runtime builder。它是 extension-only 边界：SDK 提供 core ports 和可选 adapter，
- * 不把产品 gateway 或业务工具塞进核心。
+/**
+ * @brief 由外层拥有、builder 长期借用的端口与扩展工厂集合。
+ * @note builder 保存原指针，集合、数组、名称和回调须覆盖全部代创建、退役回收及最终销毁。
+ * builder 销毁失败保留资源供重试时借用仍持续，owner 先关闭入口、排空使用者再完成销毁。
+ * 构建和重载期间配置需保持稳定，集合本身在被借用期间保持只读。
  */
 typedef struct cc_runtime_feature_set {
 
-    const cc_llm_provider_descriptor_t *llm_providers;
+    const cc_llm_provider_descriptor_t *llm_providers; /**< provider 描述符借用，非零数量时须有有效数组。 */
 
-    size_t llm_provider_count;
-
-
-    const cc_tool_descriptor_t *tools;
-
-    size_t tool_count;
+    size_t llm_provider_count; /**< provider 数量，非零缺数组在创建准入时返回参数错误。 */
 
 
-    cc_runtime_session_store_create_fn create_session_store;
+    const cc_tool_descriptor_t *tools; /**< 工具描述符借用，非零数量时须有有效数组。 */
 
-    cc_runtime_memory_store_create_fn create_memory_store;
-
-    cc_runtime_policy_create_fn create_policy_engine;
-
-    cc_runtime_sandbox_create_fn create_sandbox;
+    size_t tool_count; /**< 工具数量，零表示本集合没有内置工具。 */
 
 
-    cc_runtime_plugin_load_fn load_plugins;
+    cc_runtime_session_store_create_fn create_session_store; /**< builder 创建必需的共享会话工厂。 */
 
-    cc_runtime_plugin_destroy_fn destroy_plugins;
+    cc_runtime_memory_store_create_fn create_memory_store; /**< 可选记忆工厂，创建错误转为诊断并保持无记忆。 */
 
-    cc_runtime_mcp_load_fn load_mcp;
+    cc_runtime_policy_create_fn create_policy_engine; /**< builder 创建必需的共享策略工厂。 */
 
-    cc_runtime_mcp_destroy_fn destroy_mcp;
+    cc_runtime_sandbox_create_fn create_sandbox; /**< 可选沙箱工厂，同时提供给工具工厂上下文。 */
+
+
+    cc_runtime_plugin_load_fn load_plugins; /**< 可选插件装配回调，按 generation 调用。 */
+
+    cc_runtime_plugin_destroy_fn destroy_plugins; /**< 可选状态析构，非空插件状态须配对。 */
+
+    cc_runtime_mcp_load_fn load_mcp; /**< 可选 MCP 装配回调，按 generation 调用。 */
+
+    cc_runtime_mcp_destroy_fn destroy_mcp; /**< 可选 MCP 状态析构，非空状态须配对。 */
 } cc_runtime_feature_set_t;
 
 #endif

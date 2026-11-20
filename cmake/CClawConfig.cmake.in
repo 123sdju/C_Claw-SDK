@@ -1,7 +1,13 @@
 @PACKAGE_INIT@
 
+# 按生成 SDK 时的真实平台和 HTTP 选择恢复依赖，再导入安装目标。
 include(CMakeFindDependencyMacro)
-find_dependency(Threads)
+if(@CC_PACKAGE_REQUIRES_THREADS@)
+    find_dependency(Threads)
+endif()
+if(@CC_PACKAGE_REQUIRES_CURL@)
+    find_dependency(CURL)
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/CClawTargets.cmake")
 

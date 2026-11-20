@@ -9,18 +9,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * 引入内存 session store adapter，测试多模态消息进入历史上下文后的序列化结果。
- *
- * 这里不走存储工厂，是为了让测试目标集中在 media/message/context 三层的数据契约。
+/** @brief 创建多模态历史测试使用的内存后端。
+ * @param[out] out_store 必填新拥有槽，成功由测试 owner 在 runtime 结束后 destroy。
+ * @return 拥有结果，由调用者释放诊断，后端深拷贝消息并保管副本。
  */
 extern cc_result_t cc_memory_session_store_create(cc_session_store_t *out_store);
 
-/*
- * 最小 fake LLM，用于满足 runtime 对 provider 的依赖。
- *
- * 多模态测试不关心模型响应内容，只需要 runtime 能正常创建并让 context builder
- * 读取 session history；因此 fake_chat 返回固定完整文本即可。
+/** @brief 构造固定完整文本以提供上下文测试所需的同步 provider。
+ * @param[in] self 未使用，可空状态借用。
+ * @param[in] request 未读取的同步请求借用。
+ * @param[out] out 必填新响应槽，成功拥有文本，接收者 cleanup。
+ * @return 文本分配错误或成功，拥有诊断归接收者，无异步持有。
  */
 static cc_result_t fake_chat(void *self, const cc_llm_chat_request_t *request, cc_llm_response_t *out)
 {
@@ -45,21 +44,35 @@ static cc_llm_provider_vtable_t fake_llm_vtable = {
     NULL
 };
 
-/*
- * 验证多模态 content parts 在 SDK 各层之间保持结构化表示。
- *
- * 覆盖点包括：
- * 1. text + image artifact 可以组成 content parts 并序列化为 JSON。
- * 2. cc_message_create_parts 与 cc_message_copy 会深拷贝 content part 元数据。
- * 3. tool result 也能携带 artifact，供后续多模态工具链使用。
- * 4. 写入 session store 后再由 context builder 取出，provider 看到的 messages JSON
- *    仍包含 image/data_base64，而不是退化成普通文本。
- *
- * 嵌入式面试可重点说明：artifact 结构允许 path/base64/metadata 并存，下游平台可以
- * 按内存预算选择传引用、传摘要或传小尺寸 base64，而核心 SDK 保持统一数据模型。
+/** @brief 检查一次结果并消费其拥有诊断。
+ * @param[in] result 按值移入的调用结果。
+ * @return CC_OK 为一，其余为零，内部诊断已释放。
+ */
+static int result_ok(cc_result_t result)
+{
+    int valid = result.code == CC_OK;
+    cc_result_free(&result);
+    return valid;
+}
+
+/** @brief 核对文本与图像分片深拷贝、工具媒体及 store/context JSON 恢复。
+ * @return 全部通过为零，分阶段构造或断言错误为一至六。
+ * @note 字面量 artifact 只借用，parts/msg/copied/result 各持深副本，统一清理覆盖失败路径。
+ * 单线程独占 fixture，runtime 先销毁再归还其借用的 registry/store。
  */
 int main(void)
 {
+    int failed = 2;
+    char *parts_json = NULL;
+    cc_message_t *msg = NULL;
+    cc_message_t copied = {0};
+    cc_tool_result_t tr = {0};
+    cc_tool_registry_t *registry = NULL;
+    cc_session_store_t store = {0};
+    cc_agent_runtime_t *runtime = NULL;
+    cc_message_t *messages = NULL;
+    size_t message_count = 0;
+    char *messages_text = NULL;
     cc_media_artifact_t image = {
         .id = "img_1",
         .kind = CC_MEDIA_IMAGE,
@@ -75,47 +88,43 @@ int main(void)
     cc_content_parts_init(&parts);
     cc_result_t rc = cc_content_parts_append_text(
         &parts, "observe image", CC_CONTENT_PART_INPUT);
-    if (rc.code != CC_OK) return 2;
+    if (!result_ok(rc)) goto cleanup;
+    failed = 3;
     rc = cc_content_parts_append_artifact(&parts, &image, CC_CONTENT_PART_INPUT);
-    if (rc.code != CC_OK) return 3;
-    cc_result_free(&rc);
+    if (!result_ok(rc)) goto cleanup;
 
-    char *parts_json = NULL;
     rc = cc_content_parts_to_json(&parts, &parts_json);
-    if (rc.code != CC_OK || !parts_json ||
+    if (!result_ok(rc) || !parts_json ||
         !strstr(parts_json, "\"type\":\"image\"") ||
-        !strstr(parts_json, "\"data_base64\":\"aW1hZ2U=\"")) return 3;
+        !strstr(parts_json, "\"data_base64\":\"aW1hZ2U=\"")) goto cleanup;
 
-    cc_message_t *msg = NULL;
+    failed = 4;
     rc = cc_message_create_parts("m1", "ses_mm", CC_ROLE_USER, &parts, NULL, &msg);
-    if (rc.code != CC_OK || !msg) return 4;
-    cc_message_t copied;
-    if (cc_message_copy(msg, &copied).code != CC_OK ||
+    if (!result_ok(rc) || !msg) goto cleanup;
+    if (!result_ok(cc_message_copy(msg, &copied)) ||
         copied.content.count != parts.count ||
         copied.content.items[1].kind != CC_MEDIA_IMAGE) {
-        return 4;
+        goto cleanup;
     }
     cc_message_cleanup(&copied);
 
-    cc_tool_result_t tr = {0};
+    failed = 5;
     rc = cc_tool_result_add_artifact(&tr, &image);
-    if (rc.code != CC_OK || tr.artifacts.count != 1 ||
-        tr.artifacts.items[0].kind != CC_MEDIA_IMAGE) return 5;
+    if (!result_ok(rc) || tr.artifacts.count != 1 ||
+        tr.artifacts.items[0].kind != CC_MEDIA_IMAGE) goto cleanup;
     cc_tool_result_cleanup(&tr);
 
-    cc_tool_registry_t *registry = NULL;
-    cc_session_store_t store = {0};
-    cc_agent_runtime_t *runtime = NULL;
-    if (cc_tool_registry_create(&registry).code != CC_OK) return 1;
-    cc_tool_registry_freeze(registry);
-    if (cc_memory_session_store_create(&store).code != CC_OK) return 1;
-    store.vtable->create_session(store.self, "ses_mm", ".");
+    failed = 1;
+    if (!result_ok(cc_tool_registry_create(&registry))) goto cleanup;
+    if (!result_ok(cc_tool_registry_freeze(registry))) goto cleanup;
+    if (!result_ok(cc_memory_session_store_create(&store))) goto cleanup;
+    if (!result_ok(store.vtable->create_session(store.self, "ses_mm", "."))) goto cleanup;
     cc_session_record_t record = {
         .type = CC_SESSION_RECORD_MESSAGE,
         .session_id = "ses_mm",
         .data.message = msg,
     };
-    store.vtable->append_records(store.self, &record, 1);
+    if (!result_ok(store.vtable->append_records(store.self, &record, 1))) goto cleanup;
 
     cc_llm_provider_t llm = { NULL, &fake_llm_vtable };
     cc_agent_runtime_deps_t deps = {0};
@@ -128,32 +137,32 @@ int main(void)
     options.config.system_prompt = "system";
     options.config.workspace_dir = ".";
     options.config.model = "fake";
-    if (cc_agent_runtime_create(&deps, &options, &runtime).code != CC_OK) return 1;
+    if (!result_ok(cc_agent_runtime_create(&deps, &options, &runtime))) goto cleanup;
 
-    cc_message_t *messages = NULL;
-    size_t message_count = 0;
+    failed = 6;
     rc = cc_context_builder_build_messages(runtime, "ses_mm", "system", NULL,
                                             &messages, &message_count);
-    char *messages_text = NULL;
-    if (rc.code == CC_OK) {
-        rc = cc_messages_to_json(messages, message_count, 1, &messages_text);
-    }
-    if (rc.code != CC_OK || !messages_text ||
+    if (!result_ok(rc)) goto cleanup;
+    rc = cc_messages_to_json(messages, message_count, 1, &messages_text);
+    if (!result_ok(rc) || !messages_text ||
         !strstr(messages_text, "\"content\"") ||
         !strstr(messages_text, "image") ||
         !strstr(messages_text, "data_base64")) {
-        return 6;
+        goto cleanup;
     }
+    failed = 0;
 
+cleanup:
     free(messages_text);
     for (size_t i = 0; i < message_count; i++) cc_message_cleanup(&messages[i]);
     free(messages);
-    cc_result_free(&rc);
     cc_agent_runtime_destroy(runtime);
-    store.vtable->destroy(store.self);
+    if (store.vtable) store.vtable->destroy(store.self);
     cc_tool_registry_destroy(registry);
     cc_message_destroy(msg);
+    cc_message_cleanup(&copied);
+    cc_tool_result_cleanup(&tr);
     free(parts_json);
     cc_content_parts_cleanup(&parts);
-    return 0;
+    return failed;
 }

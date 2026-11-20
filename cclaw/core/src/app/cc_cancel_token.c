@@ -8,28 +8,22 @@
 #include <stdlib.h>
 
 
-/*
- * 取消源内部状态。
- *
- * cancelled 受 mutex 保护，token 由 source 拥有。这样多个线程可以查询取消状态，
- * runtime 拥有者可以在另一个线程发出取消。
- */
+/** 取消源拥有状态、锁和 token，外层协调所有使用者与最终销毁。 */
 struct cc_cancel_source {
-    cc_mutex_t mutex;
-    int cancelled;
-    cc_cancel_token_t *token;
+    cc_mutex_t mutex;         /**< 对象拥有，保护 cancelled 的读写。 */
+    int cancelled;           /**< 初始为零，cancel 后单调保持一。 */
+    cc_cancel_token_t *token; /**< 对象拥有的独立堆分配 token，创建后身份固定。 */
 };
 
-/* token 只保存回指 source，不拥有任何同步原语。 */
+/** token 以借用回指访问取消源的共享状态，其内存由 source 统一释放。 */
 struct cc_cancel_token {
-    cc_cancel_source_t *source;
+    cc_cancel_source_t *source; /**< 创建成功后固定指向拥有该 token 的源。 */
 };
 
-/*
- * 创建取消源和配套 token。
- *
- * 构造顺序是 source -> token -> mutex；失败时按反向顺序释放。成功后 token->source
- * 指向 source，查询函数可以通过它读取共享取消状态。
+/**
+ * @brief 按 source、token、mutex 的顺序构造取消对象，全部成功后绑定回指并发布输出。
+ * @param[out] out_source 必填且无待释放对象的输出槽，仅成功时填写，失败保持原值。
+ * @return 成功为 CC_OK，空输出为 CC_ERR_INVALID_ARGUMENT，两次堆分配失败为 CC_ERR_OUT_OF_MEMORY，mutex 创建错误原样返回并清理已分配对象。
  */
 cc_result_t cc_cancel_source_create(cc_cancel_source_t **out_source)
 {
@@ -56,11 +50,11 @@ cc_result_t cc_cancel_source_create(cc_cancel_source_t **out_source)
     return cc_result_ok();
 }
 
-/*
- * 销毁取消源。
- *
- * 这里不做引用计数，调用方必须保证 provider/tool/process 不再持有 token。嵌入式项目
- * 通常用运行队列或 join/flush 保证这个生命周期边界。
+/**
+ * @brief 销毁 mutex 后释放 token 和取消源。
+ * @pre 拥有者已排空全部查询、取消、token 获取及 provider/tool 借用，所有锁持有者和等待者均已退出。
+ * @param[in,out] source 拥有的有效源，允许 NULL。
+ * @post 非空源及其配套 token 已释放，外层借用指针失效。
  */
 void cc_cancel_source_destroy(cc_cancel_source_t *source)
 {
@@ -70,10 +64,10 @@ void cc_cancel_source_destroy(cc_cancel_source_t *source)
     free(source);
 }
 
-/*
- * 发出取消信号。
- *
- * cancelled 是单调状态：从 0 变成 1 后不会恢复。加锁保证其他线程查询时能看到一致值。
+/**
+ * @brief 锁内将 cancelled 置一，重复取消继续保持一。
+ * @param[in,out] source 调用期间保持存活的取消源，允许 NULL，销毁由外层另行排空。
+ * @post 非空源的取消状态已发布，查询会通过同一 mutex 读取，下游退出时机由其自身检查决定。
  */
 void cc_cancel_source_cancel(cc_cancel_source_t *source)
 {
@@ -85,20 +79,20 @@ void cc_cancel_source_cancel(cc_cancel_source_t *source)
     cc_mutex_unlock(source->mutex);
 }
 
-/*
- * 获取只读 token。
- *
- * token 仍由 source 拥有，调用方不能释放它；NULL source 返回 NULL，便于可选取消参数。
+/**
+ * @brief 直接读取创建成功后固定的 token 指针。
+ * @param[in] source 借用的存活源，允许 NULL，外层保证读取期间持续有效。
+ * @return source 拥有的 token 借用指针，使用期须在源销毁前结束，空源返回 NULL。
  */
 cc_cancel_token_t *cc_cancel_source_token(cc_cancel_source_t *source)
 {
     return source ? source->token : NULL;
 }
 
-/*
- * 查询取消状态。
- *
- * NULL token 视为未取消，这让很多 API 可以接受可选 token 而不用在调用点加分支。
+/**
+ * @brief 读取 token 的源并在源 mutex 内取得 cancelled 快照。
+ * @param[in] token 同步借用的查询句柄，允许 NULL，外层维持 token 及 source 的寿命。
+ * @return 源已取消返回一，未取消、空 token 或空源回指返回零。
  */
 int cc_cancel_token_is_cancelled(cc_cancel_token_t *token)
 {

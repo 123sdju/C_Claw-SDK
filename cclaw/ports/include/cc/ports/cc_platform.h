@@ -36,12 +36,35 @@
 #  endif
 #endif
 
-/* 初始化平台特定资源（内存池、日志、时钟等）；应在 main() 早期调用一次。 */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * @brief 调用已选平台的初始化入口。
+ * @post 当前四个平台的默认实现均为空操作，可重复调用。
+ * @note BSP、网络和运行时工厂各自负责具体资源的初始化与生命周期。
+ */
 void cc_platform_init(void);
-/* 返回单调递增的毫秒时间戳；用于 timeout、背压和观测计时，不受系统时间调整影响。 */
+/**
+ * @brief 读取已选平台的单调毫秒计数。
+ * @return 同一运行时钟域内的计数；POSIX 原生读取失败返回零。
+ * @note 适用于超时与观测计时，保存后的值只在原时钟域内比较。
+ * 通用 FreeRTOS 实现须在任务上下文调用，内核调度器和时基由 BSP 先行初始化。
+ */
 uint64_t cc_platform_monotonic_ms(void);
-/* 使用平台 CSPRNG 填充缓冲区；成功返回 0，平台无安全熌源时返回 -1。 */
+/**
+ * @brief 使用已选平台随机源同步填充调用者缓冲区。
+ * @param[out] buffer 借用的至少 size 字节可写区，size 为零时可为 NULL。
+ * @param[in] size 请求字节数，Windows 实现要求能由 ULONG 表示。
+ * @return 完整成功为零，参数或平台源失败为负一；通用 FreeRTOS 弱钩子默认返回负一。
+ * @note 失败可能留下部分写入，调用者应放弃这些字节。零长度调用是否访问原生源由平台实现决定。
+ */
 int cc_platform_random_bytes(void *buffer, size_t size);
+
+#ifdef __cplusplus
+}
+#endif
 
 /*
  * POSIX 默认能力矩阵。
@@ -264,7 +287,7 @@ int cc_platform_random_bytes(void *buffer, size_t size);
 #    define CC_HAS_DLOPEN 0
 #  endif
 #  ifndef CC_HAS_CLOCK_MONOTONIC
-#    define CC_HAS_CLOCK_MONOTONIC 0
+#    define CC_HAS_CLOCK_MONOTONIC 1
 #  endif
 #  define CC_LIMIT_MAX_PATH 256
 #  define CC_LIMIT_HEAP_WARN_KB 256
@@ -307,6 +330,12 @@ int cc_platform_random_bytes(void *buffer, size_t size);
 #endif
 #ifndef CC_STORAGE_JSON_FILE
 #  define CC_STORAGE_JSON_FILE 1
+#endif
+#ifndef CC_STORAGE_JSON_SEGMENTED
+#  define CC_STORAGE_JSON_SEGMENTED CC_STORAGE_JSON_FILE
+#endif
+#ifndef CC_MEMORY_STORE_JSON_FILE
+#  define CC_MEMORY_STORE_JSON_FILE CC_STORAGE_JSON_FILE
 #endif
 #ifndef CC_STORAGE_MEMORY
 #  define CC_STORAGE_MEMORY 1

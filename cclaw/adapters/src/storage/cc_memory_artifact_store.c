@@ -2,32 +2,27 @@
 #include "cc/internal/cc_alloc.h"
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
-/*
- * 内存 artifact 记录。
- *
- * session_id 用于按会话过滤，artifact 本身通过 cc_media_artifact_copy 深拷贝，避免调用方
- * 释放原 artifact 后 store 中出现悬空指针。
- */
+/** @brief 一条拥有会话过滤键和独立媒体字段的内存记录。 */
 typedef struct memory_artifact_record {
     char *session_id;
     cc_media_artifact_t artifact;
 } memory_artifact_record_t;
 
-/*
- * 内存 artifact store 私有状态。
- *
- * 当前实现没有 mutex，适合单线程测试或由上层保证串行访问的轻量 profile；需要多线程
- * 并发 artifact 写入时，应在 adapter 外层加锁或扩展本实现。
- */
+/** @brief 无内部锁的拥有数组，全部访问和销毁由调用者串行化。 */
 typedef struct memory_artifact_store {
     memory_artifact_record_t *items;
     size_t count;
     size_t capacity;
 } memory_artifact_store_t;
 
-/* 释放一条记录的会话 id 和 artifact 深拷贝字段，并把槽位清零。 */
+/**
+ * @brief 释放一条记录的会话键和媒体字段后清零。
+ * @param[in,out] record 独占拥有槽，可为 NULL，字段借用者已退出。
+ * @post 非空记录清零，槽存储继续归数组 owner。
+ */
 static void record_cleanup(memory_artifact_record_t *record)
 {
     if (!record) return;
@@ -36,15 +31,20 @@ static void record_cleanup(memory_artifact_record_t *record)
     memset(record, 0, sizeof(*record));
 }
 
-/*
- * 确保数组有一个可写槽位。
- *
- * 扩容时初始化新增区域，便于后续 destroy/cleanup 对未使用槽位保持安全。
+/**
+ * @brief 为内部数组预留一个追加槽，扩容时清零新增区域。
+ * @param[in,out] store 非 NULL、计数容量与实际分配相符的独占状态。
+ * @return 成功为 CC_OK，容量耗尽为 LIMIT_EXCEEDED，分配失败为 OUT_OF_MEMORY。
+ * @note 失败保留原数组和计数，成功扩容会使旧元素地址失效。
  */
 static cc_result_t reserve_record(memory_artifact_store_t *store)
 {
     if (store->count < store->capacity) return cc_result_ok();
-    size_t next_capacity = store->capacity ? store->capacity * 2 : 8;
+    size_t maximum = SIZE_MAX / sizeof(*store->items);
+    if (store->capacity >= maximum)
+        return cc_result_error(CC_ERR_LIMIT_EXCEEDED, "Artifact capacity overflow");
+    size_t next_capacity = store->capacity > maximum / 2 ? maximum : store->capacity * 2;
+    if (next_capacity == 0) next_capacity = maximum < 8 ? maximum : 8;
     memory_artifact_record_t *next = realloc(
         store->items, next_capacity * sizeof(memory_artifact_record_t));
     if (!next) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to grow artifact store");
@@ -55,28 +55,30 @@ static cc_result_t reserve_record(memory_artifact_store_t *store)
     return cc_result_ok();
 }
 
-/*
- * 根据 artifact_id 查找数组下标。
- *
- * 返回 long 是为了用 -1 表示未找到；调用者在转换成 size_t 前必须先判断 >= 0。
+/**
+ * @brief 按准确媒体 ID 查找第一条记录。
+ * @param[in] store 调用期稳定借用状态，须非 NULL。
+ * @param[in] artifact_id 借用 NUL 字符串，须非 NULL。
+ * @return 命中下标或 store->count 哨兵，返回类型覆盖完整数组下标。
  */
-static long find_record(memory_artifact_store_t *store, const char *artifact_id)
+static size_t find_record(const memory_artifact_store_t *store, const char *artifact_id)
 {
-    if (!store || !artifact_id) return -1;
     for (size_t i = 0; i < store->count; i++) {
         if (store->items[i].artifact.id &&
             strcmp(store->items[i].artifact.id, artifact_id) == 0) {
-            return (long)i;
+            return i;
         }
     }
-    return -1;
+    return store->count;
 }
 
-/*
- * 保存或替换 artifact。
- *
- * id 已存在时先清理旧记录再覆盖；否则追加新记录。函数成功后 store 拥有 artifact 的
- * 深拷贝，调用方仍然负责释放传入 artifact。
+/**
+ * @brief 完整复制新记录后按全局 ID 替换或追加媒体元数据。
+ * @param[in,out] self 非 NULL 存活状态，调用者排除所有并发访问。
+ * @param[in] session_id 可空会话过滤键，调用期间稳定借用，空串作为实际键保存。
+ * @param[in] artifact 非 NULL、具有非 NULL id 的稳定输入，字段可借自旧记录。
+ * @return 成功为 CC_OK，空参数为 INVALID_ARGUMENT，复制或扩容错误原样返回。
+ * @note 失败保留原记录和 count，成功后原输入仍归调用者，替换可更改关联会话。
  */
 static cc_result_t memory_artifact_put(
     void *self,
@@ -89,7 +91,7 @@ static cc_result_t memory_artifact_put(
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid artifact put argument");
     }
 
-    long existing = find_record(store, artifact->id);
+    size_t existing = find_record(store, artifact->id);
     memory_artifact_record_t next_record;
     memset(&next_record, 0, sizeof(next_record));
     next_record.session_id = session_id ? cc_copy_string(session_id) : NULL;
@@ -102,7 +104,7 @@ static cc_result_t memory_artifact_put(
         return rc;
     }
 
-    if (existing >= 0) {
+    if (existing < store->count) {
         record_cleanup(&store->items[existing]);
         store->items[existing] = next_record;
         return cc_result_ok();
@@ -117,11 +119,12 @@ static cc_result_t memory_artifact_put(
     return cc_result_ok();
 }
 
-/*
- * 按 id 读取 artifact。
- *
- * out_artifact 由调用方提供，成功后其中字段为深拷贝，调用方需要调用
- * cc_media_artifact_cleanup。
+/**
+ * @brief 取得指定媒体 ID 的独立元数据副本。
+ * @param[in] self 非 NULL 存活状态，调用者保持记录稳定。
+ * @param[in] artifact_id 非 NULL 调用期借用 ID，空串可匹配旧空 ID。
+ * @param[out] out_artifact 非 NULL 新或已清理对象，先初始化，成功后调用者 cleanup。
+ * @return 参数错误为 INVALID_ARGUMENT，缺失为 NOT_FOUND，字段复制失败返回对应结果。
  */
 static cc_result_t memory_artifact_get(
     void *self,
@@ -133,18 +136,22 @@ static cc_result_t memory_artifact_get(
     if (!out_artifact) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null artifact output");
     }
-    long index = find_record(store, artifact_id);
-    if (index < 0) {
+    cc_media_artifact_init(out_artifact);
+    if (!store || !artifact_id)
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid artifact get argument");
+    size_t index = find_record(store, artifact_id);
+    if (index == store->count) {
         return cc_result_error(CC_ERR_NOT_FOUND, "Artifact not found");
     }
     return cc_media_artifact_copy(&store->items[index].artifact, out_artifact);
 }
 
-/*
- * 列举 artifact。
- *
- * session_id 为空时返回全部 artifact；非空时只返回该会话的记录。out_artifacts 由本函数
- * 初始化，调用方最终使用 cc_media_artifact_list_cleanup 释放。
+/**
+ * @brief 按插入顺序复制全部或指定会话媒体，替换保持原位置。
+ * @param[in] self 非 NULL 稳定状态，无内部锁。
+ * @param[in] session_id 可空调用期过滤键，NULL 选全部，空串只匹配空串。
+ * @param[out] out_artifacts 非 NULL 新/已清理包装，先清空，成功后调用者 list_cleanup。
+ * @return 参数错误为 INVALID_ARGUMENT，复制失败撤销整列表并返回对应错误。
  */
 static cc_result_t memory_artifact_list(
     void *self,
@@ -153,10 +160,11 @@ static cc_result_t memory_artifact_list(
 )
 {
     memory_artifact_store_t *store = (memory_artifact_store_t *)self;
-    if (!store || !out_artifacts) {
+    if (!out_artifacts) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid artifact list argument");
     }
     cc_media_artifact_list_init(out_artifacts);
+    if (!store) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null artifact store");
     for (size_t i = 0; i < store->count; i++) {
         if (session_id && (!store->items[i].session_id ||
             strcmp(store->items[i].session_id, session_id) != 0)) {
@@ -172,16 +180,20 @@ static cc_result_t memory_artifact_list(
     return cc_result_ok();
 }
 
-/*
- * 删除指定 artifact。
- *
- * 删除后通过前移元素压缩数组，并清零尾部槽位，避免 destroy 阶段重复释放已经移动的记录。
+/**
+ * @brief 删除指定 ID 的元数据并前移后续拥有记录。
+ * @param[in,out] self 非 NULL 独占状态，删除前结束该项借用。
+ * @param[in] artifact_id 非 NULL 调用期借用 ID，可来自被删记录。
+ * @return 命中删除为 CC_OK，空参数为 INVALID_ARGUMENT，缺失为 NOT_FOUND。
+ * @note 保留数组容量，清零移动后的尾槽，本层不删除 path/uri 所指内容。
  */
 static cc_result_t memory_artifact_remove(void *self, const char *artifact_id)
 {
     memory_artifact_store_t *store = (memory_artifact_store_t *)self;
-    long index = find_record(store, artifact_id);
-    if (index < 0) return cc_result_error(CC_ERR_NOT_FOUND, "Artifact not found");
+    if (!store || !artifact_id)
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid artifact remove argument");
+    size_t index = find_record(store, artifact_id);
+    if (index == store->count) return cc_result_error(CC_ERR_NOT_FOUND, "Artifact not found");
     record_cleanup(&store->items[index]);
     size_t pos = (size_t)index;
     for (size_t i = pos + 1; i < store->count; i++) {
@@ -192,7 +204,11 @@ static cc_result_t memory_artifact_remove(void *self, const char *artifact_id)
     return cc_result_ok();
 }
 
-/* 销毁内存 artifact store 及其全部记录。 */
+/**
+ * @brief 消费全部媒体、会话键、数组和后端状态。
+ * @param[in,out] self 可空独占状态，owner 已关闭入口并排空全部方法及字段借用。
+ * @post 非空 self 及旧别名失效，调用者持有的端口描述符须自行清空。
+ */
 static void memory_artifact_destroy(void *self)
 {
     memory_artifact_store_t *store = (memory_artifact_store_t *)self;
@@ -202,7 +218,7 @@ static void memory_artifact_destroy(void *self)
     free(store);
 }
 
-/* artifact store vtable，把内存实现绑定到 cc_artifact_store_t 端口。 */
+/** @brief 进程期只读方法表，实例共同借用。 */
 static const cc_artifact_store_vtable_t memory_artifact_vtable = {
     memory_artifact_put,
     memory_artifact_get,
@@ -211,10 +227,11 @@ static const cc_artifact_store_vtable_t memory_artifact_vtable = {
     memory_artifact_destroy
 };
 
-/*
- * 创建内存 artifact store。
- *
- * 成功后 out_store 获得 self/vtable；该实现不落盘，适合测试和小型运行时缓存。
+/**
+ * @brief 创建不落盘、由外层串行访问的媒体元数据后端。
+ * @param[out] out_store 非 NULL 空拥有槽，先清零，成功交付 self 和静态方法表。
+ * @return 成功为 CC_OK，空输出为 INVALID_ARGUMENT，状态分配失败为 OUT_OF_MEMORY。
+ * @note 成功后由调用者排空入口并调用 destroy，失败输出保持空，无媒体文件创建。
  */
 cc_result_t cc_memory_artifact_store_create(cc_artifact_store_t *out_store)
 {

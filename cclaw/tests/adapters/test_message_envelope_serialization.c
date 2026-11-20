@@ -10,20 +10,18 @@
 #include <string.h>
 
 
-/*
- * 使用内存 session store 作为持久化 adapter，避免测试依赖文件系统或 SQLite。
- *
- * 这里直接链接 adapter 创建函数，是为了验证 session store 保存后的消息 envelope
- * 能被 context builder 正确还原，而不是验证 runtime builder 的工厂分发。
+/** @brief 创建本测试独占的内存会话端口，作为 context builder 的历史依赖。
+ * @param[out] out_store 必填新拥有槽，成功先排空 runtime 借用再 destroy。
+ * @return 拥有结果，创建者消费诊断，消息持久副本由后端拥有。
  */
 extern cc_result_t cc_memory_session_store_create(cc_session_store_t *out_store);
 
 
-/*
- * 最小 fake LLM：只返回一个完整 assistant 文本。
- *
- * 本测试真正关注的是发起请求前的上下文构建结果，fake_chat 不读取 request；
- * 它存在的意义是让 runtime create 通过 provider 依赖校验。
+/** @brief 构造固定完整文本响应，为上下文测试提供同步 provider。
+ * @param[in] self 未使用的状态借用，可 NULL。
+ * @param[in] request 未读取的同步请求借用。
+ * @param[out] out 必填新响应槽，初始化后拥有文本，由 runtime 或调用者 cleanup。
+ * @return set_text 的分配错误或成功，返回诊断归接收者释放，无异步资源。
  */
 static cc_result_t fake_chat(void *self, const cc_llm_chat_request_t *request, cc_llm_response_t *out)
 {
@@ -49,27 +47,37 @@ static cc_llm_provider_vtable_t fake_llm_vtable = {
 };
 
 
-/*
- * 验证 tool_calls 和 reasoning_content 经过 store/context/json 三层后没有被二次转义。
- *
- * 测试流程：
- * 1. 建立只含 fake LLM、空 tool registry 和内存 store 的 runtime。
- * 2. 手工写入 assistant tool call 消息和 tool result 消息，模拟一次工具调用历史。
- * 3. 通过 context builder 读取历史并序列化为 LLM messages JSON。
- * 4. 断言 JSON 中存在结构化 tool_calls/reasoning_content，且没有出现被转义的
- *    "\\\"tool_calls\\\""，避免 provider adapter 收到字符串套字符串。
+/** @brief 检查并消费一次拥有结果。
+ * @param[in] result 按值移入，诊断在本函数释放。
+ * @return CC_OK 为一，其他为零，无剩余拥有资源。
+ */
+static int result_ok(cc_result_t result)
+{
+    int valid = result.code == CC_OK;
+    cc_result_free(&result);
+    return valid;
+}
+
+/** @brief 验证 user、assistant tool call 与 tool result 经 store/context/JSON 完整恢复。
+ * @return 初始化、存储、构建或结构断言失败为一，全部通过为零。
+ * @note 单线程独占 fixture，runtime 借用 registry/store，先 destroy runtime 再归还依赖。
+ * 失败统一清理消息、JSON、上下文数组、runtime、store 和 registry，所有拥有诊断均消费。
  */
 int main(void)
 {
-    int failed = 0;
+    int failed = 1;
     cc_tool_registry_t *registry = NULL;
     cc_session_store_t store = {0};
     cc_agent_runtime_t *runtime = NULL;
+    cc_message_t *msg = NULL;
+    cc_message_t *messages = NULL;
+    size_t message_count = 0;
+    char *messages_text = NULL;
 
-    if (cc_tool_registry_create(&registry).code != CC_OK) return 1;
-    cc_tool_registry_freeze(registry);
-    if (cc_memory_session_store_create(&store).code != CC_OK) return 1;
-    store.vtable->create_session(store.self, "ses_msg", ".");
+    if (!result_ok(cc_tool_registry_create(&registry))) goto cleanup;
+    if (!result_ok(cc_tool_registry_freeze(registry))) goto cleanup;
+    if (!result_ok(cc_memory_session_store_create(&store))) goto cleanup;
+    if (!result_ok(store.vtable->create_session(store.self, "ses_msg", "."))) goto cleanup;
 
     cc_llm_provider_t llm = { NULL, &fake_llm_vtable };
     cc_agent_runtime_deps_t deps = {0};
@@ -83,49 +91,56 @@ int main(void)
     options.config.workspace_dir = ".";
     options.config.model = "fake";
     options.thinking_mode = 1;
-    if (cc_agent_runtime_create(&deps, &options, &runtime).code != CC_OK) return 1;
+    if (!result_ok(cc_agent_runtime_create(&deps, &options, &runtime))) goto cleanup;
 
-    cc_message_t *msg = NULL;
-    cc_message_create_text("m1", "ses_msg", CC_ROLE_ASSISTANT, NULL, NULL, &msg);
-    cc_tool_call_t call = {
-        .id = "call_1",
-        .name = "file_read",
-        .arguments_json = "{}"
-    };
-    cc_message_add_tool_call(msg, &call);
-    cc_message_set_reasoning_content(msg, "thinking");
+    if (!result_ok(cc_message_create_text("m0", "ses_msg", CC_ROLE_USER,
+                                          "read the file", NULL, &msg))) goto cleanup;
     cc_session_record_t record = {
         .type = CC_SESSION_RECORD_MESSAGE,
         .session_id = "ses_msg",
         .data.message = msg,
     };
-    store.vtable->append_records(store.self, &record, 1);
+    if (!result_ok(store.vtable->append_records(store.self, &record, 1))) goto cleanup;
     cc_message_destroy(msg);
+    msg = NULL;
 
-    cc_message_create_text("m2", "ses_msg", CC_ROLE_TOOL, "{\"ok\":true}", "call_1", &msg);
+    if (!result_ok(cc_message_create_text("m1", "ses_msg", CC_ROLE_ASSISTANT,
+                                          NULL, NULL, &msg))) goto cleanup;
+    cc_tool_call_t call = {
+        .id = "call_1",
+        .name = "file_read",
+        .arguments_json = "{}"
+    };
+    if (!result_ok(cc_message_add_tool_call(msg, &call))) goto cleanup;
+    if (!result_ok(cc_message_set_reasoning_content(msg, "thinking"))) goto cleanup;
     record.data.message = msg;
-    store.vtable->append_records(store.self, &record, 1);
+    if (!result_ok(store.vtable->append_records(store.self, &record, 1))) goto cleanup;
     cc_message_destroy(msg);
+    msg = NULL;
 
-    cc_message_t *messages = NULL;
-    size_t message_count = 0;
+    if (!result_ok(cc_message_create_text("m2", "ses_msg", CC_ROLE_TOOL,
+                                          "{\"ok\":true}", "call_1", &msg))) goto cleanup;
+    record.data.message = msg;
+    if (!result_ok(store.vtable->append_records(store.self, &record, 1))) goto cleanup;
+    cc_message_destroy(msg);
+    msg = NULL;
+
     cc_result_t rc = cc_context_builder_build_messages(
         runtime, "ses_msg", "system", NULL, &messages, &message_count);
-    char *messages_text = NULL;
-    if (rc.code == CC_OK) {
-        rc = cc_messages_to_json(messages, message_count, 1, &messages_text);
-    }
-    if (rc.code != CC_OK || !messages_text) failed = 1;
+    if (!result_ok(rc)) goto cleanup;
+    if (!result_ok(cc_messages_to_json(messages, message_count, 1, &messages_text))) goto cleanup;
+    failed = !messages_text;
     if (messages_text && !strstr(messages_text, "\"tool_calls\"")) failed = 1;
     if (messages_text && !strstr(messages_text, "\"reasoning_content\"")) failed = 1;
     if (messages_text && strstr(messages_text, "\\\"tool_calls\\\"")) failed = 1;
 
+cleanup:
+    cc_message_destroy(msg);
     free(messages_text);
     for (size_t i = 0; i < message_count; i++) cc_message_cleanup(&messages[i]);
     free(messages);
-    cc_result_free(&rc);
     cc_agent_runtime_destroy(runtime);
-    store.vtable->destroy(store.self);
+    if (store.vtable) store.vtable->destroy(store.self);
     cc_tool_registry_destroy(registry);
     return failed ? 1 : 0;
 }

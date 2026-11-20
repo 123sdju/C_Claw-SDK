@@ -1,3 +1,7 @@
+# MCU 文本 SDK 预设，缺省只保留内存会话，关闭媒体、streaming、长期记忆及三 provider。
+# 工具、队列/工具池、技能和进程扩展均默认关闭，应用提供所需端口与模型实现。
+# 平台 auto 交根解析，普通预设提供首次 option 缺省，已有 cache 可显式覆盖。
+# 本文件没有自定义函数或运行资源，根在配置阶段检查功能依赖。
 set(CC_PROFILE_TARGET_PLATFORM auto)
 
 
@@ -37,6 +41,7 @@ set(CC_PROFILE_ENABLE_SESSION_STORE_MEMORY ON)
 set(CC_PROFILE_ENABLE_SESSION_STORE_JSON_FILE OFF)
 set(CC_PROFILE_ENABLE_SESSION_STORE_SQLITE OFF)
 
+# 数据和工作区缺省位于构建目录，空会话/记忆路径表示本预设无持久后端路径。
 set(CC_PROFILE_DEFAULT_CONFIG_PATH "")
 set(CC_PROFILE_DEFAULT_DATA_DIR "${CMAKE_BINARY_DIR}/runtime/data")
 set(CC_PROFILE_DEFAULT_WORKSPACE_PATH "${CMAKE_BINARY_DIR}/runtime/workspace")

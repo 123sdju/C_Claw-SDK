@@ -2,11 +2,10 @@
 
 #include <string.h>
 
-/*
- * 函数 main：实现 cclaw/tests/adapters/test_storage_factory_failfast.c 中的 main 相关逻辑。
- *
- * 注释用于标明函数职责边界；参数校验、资源所有权、并发限制和错误码语义以函数体
- * 及对应头文件契约为准，后续维护应在修改行为时同步更新这里和项目文档。
+/** @brief 验证未知 storage_type 返回失败且交付空端口。
+ * @return 所有断言成立为零，错误地创建实例或留下半端口为一。
+ * @note 配置及字面量只同步借用，返回诊断本层释放，意外创建的实例也在返回前销毁。
+ * 单线程测试，端口输出由本栈帧独占。
  */
 int main(void)
 {
@@ -20,5 +19,6 @@ int main(void)
     cc_result_t rc = cc_storage_factory_create_store(&config, &store);
     int failed = rc.code == CC_OK || store.vtable != NULL || store.self != NULL;
     cc_result_free(&rc);
+    if (store.vtable && store.vtable->destroy) store.vtable->destroy(store.self);
     return failed ? 1 : 0;
 }

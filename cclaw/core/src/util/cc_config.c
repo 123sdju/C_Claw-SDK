@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <math.h>
 
 #if CC_LLM_OPENAI
 #define CC_DEFAULT_PROVIDER "openai"
@@ -34,8 +35,10 @@
 
 #if CC_STORAGE_SQLITE
 #define CC_DEFAULT_STORAGE_TYPE "sqlite"
-#elif CC_STORAGE_JSON_FILE
+#elif CC_STORAGE_JSON_SEGMENTED
 #define CC_DEFAULT_STORAGE_TYPE "json_segmented"
+#elif CC_STORAGE_JSON_FILE
+#define CC_DEFAULT_STORAGE_TYPE "json"
 #else
 #define CC_DEFAULT_STORAGE_TYPE "memory"
 #endif
@@ -118,11 +121,11 @@
 #define CC_CONFIG_LOG_FATAL 5
 
 
-/*
- * 读取整个文本文件。
- *
- * 该 helper 用于 system prompt 文件拼接，返回缓冲由调用方 free()。空文件或读取失败都
- * 返回 NULL，调用方会继续尝试其他 prompt 来源。
+/**
+ * @brief 从默认文件系统读取整个文本，供配置文件和提示词来源使用。
+ * @param[in] path 借用的路径，NULL 是否可读由文件系统端口决定。
+ * @return 拥有的 NUL 结尾正文由调用者 free，无法取得读取能力或读取失败时通常为 NULL，空文件可返回空字符串。
+ * @note 临时文件系统句柄在读取后销毁，读取错误消息在本函数消费。
  */
 static char *read_text_file(const char *path)
 {
@@ -141,10 +144,11 @@ static char *read_text_file(const char *path)
 }
 
 
-/*
- * 替换配置字符串字段。
- *
- * 新值复制成功后才释放旧值，避免 OOM 时把原配置字段清空。value 为 NULL 表示不修改。
+/**
+ * @brief 复制新字符串后替换配置字段，分配失败保留旧值。
+ * @param[in,out] field 必需的拥有字符串槽，旧字符串可为 NULL。
+ * @param[in] value 借用正文，可指向旧值，NULL 表示跳过。
+ * @return 成功或跳过为一，复制失败为零。
  */
 static int replace_string(char **field, const char *value)
 {
@@ -156,16 +160,12 @@ static int replace_string(char **field, const char *value)
     return 1;
 }
 
-/*
- * 将根目录和叶子名拼接为完整路径，写入 field（释放旧值）。
- *
- * 参数:
- *   field - 目标字符串指针（旧值会被释放）
- *   root  - 根目录路径
- *   leaf  - 文件名或子目录名
- * 返回: 1 成功，0 内存分配失败。
- *
- * 自动处理路径分隔符。
+/**
+ * @brief 拼接根路径和叶子名，成功后替换并释放旧路径。
+ * @param[in,out] field 必需的拥有字符串槽，失败保留旧值。
+ * @param[in] root 借用根路径，末尾没有斜线或反斜线时补斜线，NULL 跳过。
+ * @param[in] leaf 借用叶子名，NULL 跳过。
+ * @return 成功或跳过为一，长度溢出或分配失败为零。
  */
 static int replace_joined_path(char **field, const char *root, const char *leaf)
 {
@@ -174,7 +174,9 @@ static int replace_joined_path(char **field, const char *root, const char *leaf)
     size_t leaf_len = strlen(leaf);
     int has_sep = root_len > 0 &&
         (root[root_len - 1] == '/' || root[root_len - 1] == '\\');
-    char *path = malloc(root_len + leaf_len + (has_sep ? 1 : 2));
+    size_t extra = has_sep ? 1U : 2U;
+    if (leaf_len > SIZE_MAX - extra || root_len > SIZE_MAX - leaf_len - extra) return 0;
+    char *path = malloc(root_len + leaf_len + extra);
     if (!path) return 0;
     memcpy(path, root, root_len);
     size_t pos = root_len;
@@ -187,7 +189,12 @@ static int replace_joined_path(char **field, const char *root, const char *leaf)
 }
 
 
-/* 从 JSON object 中读取字符串字段；返回 JSON AST 内部借用指针。 */
+/**
+ * @brief 读取 JSON 对象的字符串字段。
+ * @param[in] obj 借用对象，可为 NULL。
+ * @param[in] key 借用字段名，可为 NULL。
+ * @return 字符串节点内借用指针，空参数、字段缺失或类型不符为 NULL，寿命沿 AST。
+ */
 static const char *json_string_field(cc_json_value_t *obj, const char *key)
 {
     if (!obj || !key) return NULL;
@@ -195,10 +202,10 @@ static const char *json_string_field(cc_json_value_t *obj, const char *key)
 }
 
 
-/*
- * 解析 bool-like 配置值。
- *
- * 支持 true/1/on/yes 字符串，也支持 JSON bool 或非零数字，方便手写配置文件兼容不同风格。
+/**
+ * @brief 将兼容形式的 JSON 配置值转换为布尔值。
+ * @param[in] value 可选借用节点，字符串仅识别小写 true、1、on、yes，其余沿 bool/int getter。
+ * @return 命中真字符串、JSON true 或非零整数视图为一，其余为零。
  */
 static int json_boolish_value(cc_json_value_t *value)
 {
@@ -210,13 +217,11 @@ static int json_boolish_value(cc_json_value_t *value)
     return cc_json_bool_value(value) || cc_json_int_value(value) != 0;
 }
 
-/*
- * 将 JSON 中的日志级别字符串解析为数值。
- *
- * 参数:
- *   value    - 包含级别字符串的 JSON 值（如 "debug"、"info"、"error"）
- *   fallback - JSON 值无效或为 NULL 时的默认值
- * 返回: 日志级别数值（0=trace 到 5=fatal）。
+/**
+ * @brief 解析小写日志级别名称或节点的整数视图。
+ * @param[in] value 可选借用节点，非字符串节点交 int getter。
+ * @param[in] fallback 节点缺失或字符串名称未知时采用的值。
+ * @return 已识别名称对应的 trace 到 fatal 数值、整数视图或 fallback，不额外限制整数范围。
  */
 static int parse_log_level_value(cc_json_value_t *value, int fallback)
 {
@@ -233,15 +238,11 @@ static int parse_log_level_value(cc_json_value_t *value, int fallback)
     return value ? cc_json_int_value(value) : fallback;
 }
 
-/*
- * 从 JSON 配置根节点解析 HTTP 网络配置（超时、重试、日志级别、trace）。
- *
- * 参数:
- *   config - 目标 cc_config_t（字段被直接修改）
- *   root   - JSON 根对象
- *
- * 读取 network.http 节点下的 connect_timeout_ms、first_byte_timeout_ms、
- * stream_idle_timeout_ms、retry_count、log_level 和 trace 子配置。
+/**
+ * @brief 覆盖 network.http 的超时、重试、日志级别和 trace 标志。
+ * @param[in,out] config 必需的已初始化配置，原位覆盖存在的标量。
+ * @param[in] root 借用 JSON 根，缺少有效 http 对象时跳过。
+ * @post 存在字段已按兼容别名和 getter 规则转换，缺失字段保留原值，无资源交接。
  */
 static void parse_network_http_config(cc_config_t *config, cc_json_value_t *root)
 {
@@ -277,7 +278,11 @@ static void parse_network_http_config(cc_config_t *config, cc_json_value_t *root
     }
 }
 
-/* 释放配置字符串列表。 */
+/**
+ * @brief 释放配置列表拥有的字符串及数组并清零。
+ * @param[in,out] list 可选列表，count 个槽必须可读且各字符串可独立 free。
+ * @post 非 NULL 列表归零，可再次清理，所有旧借用失效。
+ */
 static void free_string_list(cc_config_string_list_t *list)
 {
     if (!list) return;
@@ -286,10 +291,16 @@ static void free_string_list(cc_config_string_list_t *list)
     memset(list, 0, sizeof(*list));
 }
 
-/* 向配置字符串列表追加一项深拷贝。 */
+/**
+ * @brief 向配置列表追加一个拥有的字符串副本。
+ * @param[in,out] list 可选有效列表，NULL 时跳过，失败保留已计数内容，数组地址可能改变。
+ * @param[in] value 借用正文，NULL 时跳过。
+ * @return 成功或跳过为一，长度溢出、扩容或复制失败为零。
+ */
 static int append_string_to_list(cc_config_string_list_t *list, const char *value)
 {
     if (!list || !value) return 1;
+    if (list->count >= SIZE_MAX / sizeof(char *)) return 0;
     char **next = realloc(list->items, (list->count + 1) * sizeof(char *));
     if (!next) return 0;
     list->items = next;
@@ -299,10 +310,11 @@ static int append_string_to_list(cc_config_string_list_t *list, const char *valu
     return 1;
 }
 
-/*
- * 从 JSON 字符串数组解析配置列表。
- *
- * 先释放 out 中旧列表，再逐项复制字符串；非数组或缺失字段表示空列表且不是错误。
+/**
+ * @brief 清理旧列表后复制 JSON 数组中的字符串项。
+ * @param[in] array 可选借用数组，缺失或非数组得到空列表，非字符串项忽略。
+ * @param[in,out] out 必需的有效拥有列表，复制失败保留可清理的部分结果。
+ * @return 完成或空数组为一，空输出、扩容或复制失败为零。
  */
 static int parse_string_array(cc_json_value_t *array, cc_config_string_list_t *out)
 {
@@ -317,7 +329,11 @@ static int parse_string_array(cc_json_value_t *array, cc_config_string_list_t *o
     return 1;
 }
 
-/* 释放单个 agent profile 的所有字段。 */
+/**
+ * @brief 释放 agent profile 的全部拥有字段并清零。
+ * @param[in,out] profile 可选有效 profile，允许部分初始化。
+ * @post 原字符串与技能列表已释放，非 NULL 结构归零。
+ */
 static void free_agent_profile(cc_config_agent_profile_t *profile)
 {
     if (!profile) return;
@@ -330,7 +346,11 @@ static void free_agent_profile(cc_config_agent_profile_t *profile)
     memset(profile, 0, sizeof(*profile));
 }
 
-/* 释放单个 plugin 配置项及其 args/tools/skill_dirs。 */
+/**
+ * @brief 释放 plugin 的字符串、参数、工具声明及技能目录。
+ * @param[in,out] entry 可选有效条目，已计数槽可部分初始化。
+ * @post 非 NULL 条目的拥有资源全部释放并归零。
+ */
 static void free_plugin_entry(cc_config_plugin_entry_t *entry)
 {
     if (!entry) return;
@@ -348,7 +368,11 @@ static void free_plugin_entry(cc_config_plugin_entry_t *entry)
     memset(entry, 0, sizeof(*entry));
 }
 
-/* 释放单个 MCP server 配置项。 */
+/**
+ * @brief 释放 MCP server 的拥有字符串与参数列表。
+ * @param[in,out] server 可选有效条目，允许部分初始化。
+ * @post 非 NULL 条目归零，原借用指针失效。
+ */
 static void free_mcp_server(cc_config_mcp_server_t *server)
 {
     if (!server) return;
@@ -362,18 +386,25 @@ static void free_mcp_server(cc_config_mcp_server_t *server)
     memset(server, 0, sizeof(*server));
 }
 
-/* 如果 JSON 中存在 key，就复制到 out 字符串字段。 */
+/**
+ * @brief 将存在的 JSON 字符串字段复制到配置槽。
+ * @param[in] obj 可选借用对象。
+ * @param[in] key 借用字段名，NULL 视为缺失。
+ * @param[in,out] out 有字符串字段时必需的拥有槽，复制成功后释放旧值。
+ * @return 缺失、类型不符或替换成功为一，复制失败为零。
+ */
 static int copy_json_string_field(cc_json_value_t *obj, const char *key, char **out)
 {
     const char *value = json_string_field(obj, key);
     return value ? replace_string(out, value) : 1;
 }
 
-/*
- * 解析字符串参数数组。
- *
- * 先释放旧 args，再为 JSON 数组中的字符串项建立新数组；非字符串项被忽略，适合配置
- * 容错，但仍会在 command 缺失等关键处由 validate 阶段报错。
+/**
+ * @brief 清理旧参数数组后深拷贝 JSON 数组中的字符串。
+ * @param[in] array 可选借用节点，缺失或非数组得到空参数列表。
+ * @param[in,out] out_args 必需的有效拥有数组槽，进入后释放旧值并置 NULL。
+ * @param[in,out] out_count 必需的旧数组条数，进入后置零，成功写有效字符串数。
+ * @return 完成为一，空输出或分配失败为零，失败清理新部分结果并保留空输出。
  */
 static int copy_args_array(cc_json_value_t *array, char ***out_args, size_t *out_count)
 {
@@ -403,11 +434,12 @@ static int copy_args_array(cc_json_value_t *array, char ***out_args, size_t *out
     return 1;
 }
 
-/*
- * 解析单个 agent profile。
- *
- * fallback_id 用于 defaults 或对象 key 作为 profile id；同时支持 camelCase 和 snake_case
- * 字段，降低配置迁移成本。
+/**
+ * @brief 覆盖单个 agent profile，并重建其技能列表。
+ * @param[in] obj 可选借用对象，非对象时仅应用缺省 ID。
+ * @param[in] fallback_id 可选借用缺省 ID，只在 out 尚无 ID 时复制。
+ * @param[in,out] out 必需的有效 profile，字段副本归其拥有，失败允许部分覆盖并可清理。
+ * @return 完成为一，空输出或分配失败为零，同字段 snake_case 在后读取时覆盖 camelCase。
  */
 static int parse_agent_profile(cc_json_value_t *obj, const char *fallback_id, cc_config_agent_profile_t *out)
 {
@@ -425,11 +457,10 @@ static int parse_agent_profile(cc_json_value_t *obj, const char *fallback_id, cc
     return 1;
 }
 
-/*
- * 同步旧 enabled_tools 缓存。
- *
- * 早期 API 直接读取 config->enabled_tools；新配置使用 tools.enabled。这里复制一份兼容
- * 缓存，避免 runtime builder 和旧测试读取不同字段。
+/**
+ * @brief 从 tools.enabled 重建独立拥有的 enabled_tools 兼容缓存。
+ * @param[in,out] config 必需有效配置，旧缓存先释放，源列表保留。
+ * @return 完成为一，分配失败为零，失败时计数覆盖已复制项以便 destroy 清理。
  */
 static int sync_enabled_tools_cache(cc_config_t *config)
 {
@@ -443,13 +474,17 @@ static int sync_enabled_tools_cache(cc_config_t *config)
     for (size_t i = 0; i < config->tools.enabled.count; i++) {
         config->enabled_tools[i] = cc_copy_string(config->tools.enabled.items[i]);
         if (!config->enabled_tools[i]) return 0;
+        config->enabled_tools_count++;
     }
-    config->enabled_tools_count = config->tools.enabled.count;
     return 1;
 }
 
 
-/* 检查默认配置中必须分配成功的字段。 */
+/**
+ * @brief 检查所有必需默认字符串均已分配。
+ * @param[in] config 必需借用的默认配置，可以部分初始化。
+ * @return 所列字段均非 NULL 为 CC_OK，否则为 CC_ERR_OUT_OF_MEMORY，错误消息由调用者释放。
+ */
 static cc_result_t config_required_allocs_ok(const cc_config_t *config)
 {
     if (!config->provider || !config->model || !config->base_url ||
@@ -465,7 +500,27 @@ static cc_result_t config_required_allocs_ok(const cc_config_t *config)
     return cc_result_ok();
 }
 
-/* 解析 queue 配置段。 */
+/**
+ * @brief 将节点的数值视图安全转换为 size_t。
+ * @param[in] node 借用节点，类型转换规则沿 number getter。
+ * @param[out] out_value 必需输出，有限非负且可表示时写入截断整数，失败保持原值。
+ * @return 可安全转换为一，负值、非有限或超出 size_t 表示范围为零。
+ */
+static int parse_size_value(cc_json_value_t *node, size_t *out_value)
+{
+    double value = cc_json_number_value(node);
+    double exclusive_limit = (double)(SIZE_MAX / 2U + 1U) * 2.0;
+    if (!isfinite(value) || value < 0.0 || value >= exclusive_limit) return 0;
+    *out_value = (size_t)value;
+    return 1;
+}
+
+/**
+ * @brief 覆盖队列 lane、模式、等待与完成项预算。
+ * @param[in,out] config 必需的已初始化配置，缺失字段保留原值，失败可部分覆盖。
+ * @param[in] root 借用根节点，缺失或非对象 queue 跳过。
+ * @return 完成为一，字符串分配失败为零，不可表示的无符号数值为负一。
+ */
 static int parse_queue_section(cc_config_t *config, cc_json_value_t *root)
 {
     cc_json_value_t *queue = cc_json_object_get(root, "queue");
@@ -493,22 +548,23 @@ static int parse_queue_section(cc_config_t *config, cc_json_value_t *root)
     if (v) config->queue.max_pending_per_session = cc_json_int_value(v);
     v = cc_json_object_get(queue, "maxTotalTasks");
     if (!v) v = cc_json_object_get(queue, "max_total_tasks");
-    if (v) {
-        double value = cc_json_number_value(v);
-        if (value < 0 || value > (double)SIZE_MAX) return 0;
-        config->queue.max_total_tasks = (size_t)value;
-    }
+    if (v && !parse_size_value(v, &config->queue.max_total_tasks)) return -1;
     v = cc_json_object_get(queue, "completedTtlMs");
     if (!v) v = cc_json_object_get(queue, "completed_ttl_ms");
     if (v) {
         double value = cc_json_number_value(v);
-        if (value < 0 || value > (double)UINT_MAX) return 0;
+        if (!isfinite(value) || value < 0 || value > (double)UINT_MAX) return -1;
         config->queue.completed_ttl_ms = (unsigned)value;
     }
     return 1;
 }
 
-/* 解析 agents 配置段，包括 defaults 和 list。 */
+/**
+ * @brief 覆盖 agents.defaults 并重建存在的 list 数组。
+ * @param[in,out] config 必需有效配置，列表槽在解析前计数，失败保留可销毁的部分结果。
+ * @param[in] root 借用根节点，缺失 agents 或 list 时保留对应旧值。
+ * @return 完成或缺失段为一，分配或 profile 复制失败为零。
+ */
 static int parse_agents_section(cc_config_t *config, cc_json_value_t *root)
 {
     cc_json_value_t *agents = cc_json_object_get(root, "agents");
@@ -529,22 +585,22 @@ static int parse_agents_section(cc_config_t *config, cc_json_value_t *root)
     config->agents.profiles = calloc((size_t)count, sizeof(cc_config_agent_profile_t));
     if (!config->agents.profiles) return 0;
     for (int i = 0; i < count; i++) {
+        cc_config_agent_profile_t *profile = &config->agents.profiles[config->agents.profile_count++];
         if (!parse_agent_profile(
                 cc_json_array_get(list, i),
                 NULL,
-                &config->agents.profiles[config->agents.profile_count])) {
+                profile)) {
             return 0;
         }
-        config->agents.profile_count++;
     }
     return 1;
 }
 
-/*
- * 解析 tools 配置段。
- *
- * 包括 enabled、network allowlist、默认 timeout 和 perTool 策略；解析后同步旧 enabled_tools
- * 缓存，确保旧调用路径仍能看到工具启用列表。
+/**
+ * @brief 解析工具启用列表、网络允许列表、超时与逐工具策略。
+ * @param[in,out] config 必需有效配置，存在 enabled 时重建独立兼容缓存，失败保留可清理状态。
+ * @param[in] root 借用根节点，缺失 tools 时跳过，存在 tools 时重建策略数组。
+ * @return 完成为一，数组、字符串或兼容缓存分配失败为零。
  */
 static int parse_tools_section(cc_config_t *config, cc_json_value_t *root)
 {
@@ -596,7 +652,13 @@ static int parse_tools_section(cc_config_t *config, cc_json_value_t *root)
     return 1;
 }
 
-/* 解析 plugin 声明的 tools 数组，并把 parameters AST 转成 JSON 字符串保存。 */
+/**
+ * @brief 复制 plugin 工具声明，将参数 schema 序列化为拥有正文。
+ * @pre entry 的 tools 数组和计数为空。
+ * @param[in] array 可选借用数组，缺失或非数组时跳过。
+ * @param[in,out] entry 必需条目，解析前计数新槽，失败部分字段由 free_plugin_entry 清理。
+ * @return 完成为一，缺少名称或描述、分配或现有 schema 序列化失败为零。
+ */
 static int parse_plugin_tools(cc_json_value_t *array, cc_config_plugin_entry_t *entry)
 {
     if (!array || !cc_json_is_array(array)) return 1;
@@ -605,25 +667,24 @@ static int parse_plugin_tools(cc_json_value_t *array, cc_config_plugin_entry_t *
     if (count > 0 && !entry->tools) return 0;
     for (int i = 0; i < count; i++) {
         cc_json_value_t *tool = cc_json_array_get(array, i);
-        cc_config_plugin_tool_t *out = &entry->tools[entry->tool_count];
+        cc_config_plugin_tool_t *out = &entry->tools[entry->tool_count++];
         const char *s = json_string_field(tool, "name");
         out->name = s ? cc_copy_string(s) : NULL;
         s = json_string_field(tool, "description");
         out->description = s ? cc_copy_string(s) : NULL;
         cc_json_value_t *params = cc_json_object_get(tool, "parameters");
-        out->parameters_json = params ? cc_json_stringify_unformatted(params) : NULL;
-        if (!out->parameters_json) out->parameters_json = cc_copy_string("{\"type\":\"object\",\"properties\":{}}");
+        out->parameters_json = params ? cc_json_stringify_unformatted(params) :
+            cc_copy_string("{\"type\":\"object\",\"properties\":{}}");
         if (!out->name || !out->description || !out->parameters_json) return 0;
-        entry->tool_count++;
     }
     return 1;
 }
 
-/*
- * 解析 plugins 配置段。
- *
- * entries 是按对象 key 命名的 plugin 集合；每个 plugin 设置默认并发、timeout 和重启策略，
- * 再读取 command/args/tools/skills。
+/**
+ * @brief 覆盖插件热重载设置并重建按对象键命名的 entries。
+ * @param[in,out] config 必需有效配置，新条目先计数再解析，失败可由 destroy 清理。
+ * @param[in] root 借用根节点，缺失 plugins 时跳过，缺失 entries 时清空旧集合。
+ * @return 完成为一，字符串、参数、工具或技能目录复制失败为零。
  */
 static int parse_plugins_section(cc_config_t *config, cc_json_value_t *root)
 {
@@ -649,7 +710,7 @@ static int parse_plugins_section(cc_config_t *config, cc_json_value_t *root)
     for (int i = 0; i < count; i++) {
         const char *id = cc_json_object_key_at(entries, i);
         cc_json_value_t *entry_json = cc_json_object_value_at(entries, i);
-        cc_config_plugin_entry_t *entry = &config->plugins.entries[config->plugins.entry_count];
+        cc_config_plugin_entry_t *entry = &config->plugins.entries[config->plugins.entry_count++];
         entry->id = id ? cc_copy_string(id) : NULL;
         entry->enabled = 1;
         entry->workers = 1;
@@ -674,12 +735,16 @@ static int parse_plugins_section(cc_config_t *config, cc_json_value_t *root)
         if (v) entry->restart_on_crash = json_boolish_value(v);
         if (!parse_plugin_tools(cc_json_object_get(entry_json, "tools"), entry)) return 0;
         if (!parse_string_array(cc_json_object_get(entry_json, "skills"), &entry->skill_dirs)) return 0;
-        config->plugins.entry_count++;
     }
     return 1;
 }
 
-/* 解析 skills.load 配置段。 */
+/**
+ * @brief 覆盖 skills.load 的监听标志、去抖毫秒和额外目录。
+ * @param[in,out] config 必需有效配置，存在 extraDirs 时替换旧列表。
+ * @param[in] root 借用根节点，缺失有效 load 时跳过。
+ * @return 完成为一，目录数组复制失败为零，失败保留可清理的部分列表。
+ */
 static int parse_skills_section(cc_config_t *config, cc_json_value_t *root)
 {
     cc_json_value_t *skills = cc_json_object_get(root, "skills");
@@ -698,7 +763,12 @@ static int parse_skills_section(cc_config_t *config, cc_json_value_t *root)
     return 1;
 }
 
-/* 解析 MCP server 配置段。 */
+/**
+ * @brief 覆盖 MCP 标志与空闲期限并重建命名 server 集合。
+ * @param[in,out] config 必需有效配置，新 server 先计数，字段副本归配置拥有。
+ * @param[in] root 借用根节点，缺失 mcp 时跳过，存在 mcp 时缺失 servers 清空旧集合。
+ * @return 完成为一，数组或字段复制失败为零，部分结果可由 destroy 清理。
+ */
 static int parse_mcp_section(cc_config_t *config, cc_json_value_t *root)
 {
     cc_json_value_t *mcp = cc_json_object_get(root, "mcp");
@@ -722,7 +792,7 @@ static int parse_mcp_section(cc_config_t *config, cc_json_value_t *root)
     for (int i = 0; i < count; i++) {
         const char *name = cc_json_object_key_at(servers, i);
         cc_json_value_t *server_json = cc_json_object_value_at(servers, i);
-        cc_config_mcp_server_t *server = &config->mcp.servers[config->mcp.server_count];
+        cc_config_mcp_server_t *server = &config->mcp.servers[config->mcp.server_count++];
         server->name = name ? cc_copy_string(name) : NULL;
         if (name && !server->name) return 0;
         if (!copy_json_string_field(server_json, "command", &server->command)) return 0;
@@ -734,12 +804,16 @@ static int parse_mcp_section(cc_config_t *config, cc_json_value_t *root)
         v = cc_json_object_get(server_json, "connectionTimeoutMs");
         if (!v) v = cc_json_object_get(server_json, "connection_timeout_ms");
         if (v) server->connection_timeout_ms = cc_json_int_value(v);
-        config->mcp.server_count++;
     }
     return 1;
 }
 
-/* 解析 image/audio/video/file 四个 modality bool 开关。 */
+/**
+ * @brief 按存在字段覆盖 image、audio、video 和 file 标志。
+ * @param[in] obj 借用对象，NULL 或非对象时跳过。
+ * @param[in,out] flags 可选标量输出，NULL 时跳过，字段按 bool-like 规则读取。
+ * @post 存在的标志已覆盖，缺失字段保留原值，无资源分配。
+ */
 static void parse_modality_flags(cc_json_value_t *obj, cc_config_modality_flags_t *flags)
 {
     if (!obj || !cc_json_is_object(obj) || !flags) return;
@@ -753,7 +827,12 @@ static void parse_modality_flags(cc_json_value_t *obj, cc_config_modality_flags_
     if (v) flags->file = json_boolish_value(v);
 }
 
-/* 解析 multimodal 配置段，包括 input/output 开关和资源限制。 */
+/**
+ * @brief 覆盖多模态输入输出标志、字节预算和 MIME 前缀列表。
+ * @param[in,out] config 必需有效配置，分配失败保留可销毁的部分覆盖状态。
+ * @param[in] root 借用根节点，缺失有效段或字段时保留原值。
+ * @return 完成为一，列表分配失败为零，不可表示的 size_t 预算为负一。
+ */
 static int parse_multimodal_section(cc_config_t *config, cc_json_value_t *root)
 {
     cc_json_value_t *mm = cc_json_object_get(root, "multimodal");
@@ -765,13 +844,13 @@ static int parse_multimodal_section(cc_config_t *config, cc_json_value_t *root)
     if (!limits || !cc_json_is_object(limits)) return 1;
     cc_json_value_t *v = cc_json_object_get(limits, "max_artifacts");
     if (!v) v = cc_json_object_get(limits, "maxArtifacts");
-    if (v) config->multimodal.limits.max_artifacts = (size_t)cc_json_int_value(v);
+    if (v && !parse_size_value(v, &config->multimodal.limits.max_artifacts)) return -1;
     v = cc_json_object_get(limits, "max_artifact_bytes");
     if (!v) v = cc_json_object_get(limits, "maxArtifactBytes");
-    if (v) config->multimodal.limits.max_artifact_bytes = (size_t)cc_json_number_value(v);
+    if (v && !parse_size_value(v, &config->multimodal.limits.max_artifact_bytes)) return -1;
     v = cc_json_object_get(limits, "max_base64_bytes");
     if (!v) v = cc_json_object_get(limits, "maxBase64Bytes");
-    if (v) config->multimodal.limits.max_base64_bytes = (size_t)cc_json_number_value(v);
+    if (v && !parse_size_value(v, &config->multimodal.limits.max_base64_bytes)) return -1;
     v = cc_json_object_get(limits, "allow_inline_base64");
     if (!v) v = cc_json_object_get(limits, "allowInlineBase64");
     if (v) config->multimodal.limits.allow_inline_base64 = json_boolish_value(v);
@@ -783,29 +862,39 @@ static int parse_multimodal_section(cc_config_t *config, cc_json_value_t *root)
     return 1;
 }
 
-/*
- * 解析所有 runtime 相关扩展配置段。
- *
- * 拆成多个 section parser 可以让缺失段按默认值运行，任一段 OOM 或结构错误时统一返回 0。
+/**
+ * @brief 按队列、agent、工具、插件、技能、MCP 和多模态顺序覆盖扩展段。
+ * @param[in,out] config 必需有效配置，失败保留已覆盖字段，调用者负责 destroy。
+ * @param[in] root 借用根节点，各段沿自身的缺失字段兼容规则。
+ * @return 完成为一，分配或必需插件字段缺失为零，无符号预算不可表示为负一。
  */
 static int parse_runtime_sections(cc_config_t *config, cc_json_value_t *root)
 {
-    return parse_queue_section(config, root) &&
-           parse_agents_section(config, root) &&
+    int queue_status = parse_queue_section(config, root);
+    if (queue_status != 1) return queue_status;
+    if (!(parse_agents_section(config, root) &&
            parse_tools_section(config, root) &&
            parse_plugins_section(config, root) &&
            parse_skills_section(config, root) &&
-           parse_mcp_section(config, root) &&
-           parse_multimodal_section(config, root);
+           parse_mcp_section(config, root))) return 0;
+    return parse_multimodal_section(config, root);
 }
 
-/* 判断字符串是否非空；用于 validate 阶段给出明确错误。 */
+/**
+ * @brief 判断可选字符串是否至少含一个非 NUL 字节。
+ * @param[in] s 可选借用 NUL 结尾字符串。
+ * @return 非 NULL 且首字节非零为一，其余为零。
+ */
 static int str_nonempty(const char *s)
 {
     return s && s[0] != '\0';
 }
 
-/* 检查 MCP transport 名称是否为当前 SDK 认识的类型。 */
+/**
+ * @brief 判断 MCP 传输名是否属于配置层认识的集合。
+ * @param[in] transport 可选借用名称，NULL 使用 stdio。
+ * @return stdio、http、sse 或 streamable_http 为一，其余为零，实际可用性仍由适配器决定。
+ */
 static int mcp_transport_known(const char *transport)
 {
     const char *t = transport ? transport : "stdio";
@@ -815,11 +904,11 @@ static int mcp_transport_known(const char *transport)
            strcmp(t, "streamable_http") == 0;
 }
 
-/*
- * 校验 runtime 扩展配置。
- *
- * 该阶段不分配资源，只检查并发/timeout 非负、plugin command、MCP transport/url 等语义，
- * 让配置错误在 runtime builder 前 fail-fast。
+/**
+ * @brief 核对运行预算、上下文、队列、插件、MCP 与分段存储的已实现约束。
+ * @param[in] config 借用有效配置，NULL 返回参数错误，数组计数与指针须一致。
+ * @return 已检查项满足约束为 CC_OK，否则为带拥有错误消息的 CC_ERR_INVALID_ARGUMENT。
+ * @note 不创建运行资源，错误诊断自身可以分配内存，未列入检查的字段沿下游契约。
  */
 static cc_result_t validate_runtime_sections(const cc_config_t *config)
 {
@@ -835,8 +924,10 @@ static cc_result_t validate_runtime_sections(const cc_config_t *config)
     if (config->context_window_tokens <= 0 ||
         config->context_keep_recent < 0 ||
         config->summary_max_tokens <= 0 ||
+        !isfinite(config->context_compress_threshold) ||
         config->context_compress_threshold < 0.0 ||
         config->context_compress_threshold > 1.0 ||
+        !isfinite(config->summary_temperature) ||
         config->summary_temperature < 0.0) {
         return cc_result_error(CC_ERR_INVALID_ARGUMENT,
                                "context compression settings are out of range");
@@ -945,11 +1036,11 @@ static cc_result_t validate_runtime_sections(const cc_config_t *config)
     return cc_result_ok();
 }
 
-/*
- * 校验完整配置。
- *
- * 先校验 runtime sections，再校验 multimodal 与当前编译 profile 的能力开关是否匹配，
- * 避免未编译的媒体能力在运行时静默降级。
+/**
+ * @brief 核对配置已实现的语义约束及多模态编译能力。
+ * @param[in] config 借用配置，NULL 返回参数错误，校验期间由拥有者保持稳定。
+ * @return 通过为 CC_OK，标量或必需字段非法为 CC_ERR_INVALID_ARGUMENT，媒体能力未编译为 CC_ERR_UNSUPPORTED。
+ * @note 不修改配置，不验证网络连通性、路径可读性或所有 provider 与工具是否已装配。
  */
 cc_result_t cc_config_validate(const cc_config_t *config)
 {
@@ -985,14 +1076,15 @@ cc_result_t cc_config_validate(const cc_config_t *config)
 }
 
 
-/*
- * 加载默认配置。
- *
- * 默认值来自编译期 profile 宏，体现“核心 SDK 可裁剪”的设计。所有字段都在 config 中
- * 拥有，失败时调用 cc_config_destroy() 回滚已分配资源。
+/**
+ * @brief 按编译配置构造独立拥有的默认配置。
+ * @param[out] out_config 必需且无已有资源，进入后清零，成功字段归调用者 destroy。
+ * @return 成功为 CC_OK，空输出为 CC_ERR_INVALID_ARGUMENT，必需默认字符串分配失败为 CC_ERR_OUT_OF_MEMORY 并清零输出。
+ * @note 本函数直接创建默认值，不读取文件或环境变量，也不执行完整 validate。
  */
 cc_result_t cc_config_load_default(cc_config_t *out_config)
 {
+    if (!out_config) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null config output");
     memset(out_config, 0, sizeof(cc_config_t));
     out_config->provider = cc_copy_string(CC_DEFAULT_PROVIDER);
     out_config->model = cc_copy_string(CC_DEFAULT_MODEL);
@@ -1069,11 +1161,12 @@ cc_result_t cc_config_load_default(cc_config_t *out_config)
 }
 
 
-/*
- * 从 JSON 文件加载配置并覆盖默认值。
- *
- * 流程是先加载默认配置，再按文件中 model/storage/workspace/sandbox/memory/tools/system/cli
- * 以及 runtime sections 覆盖。任何 OOM 走统一 oom 标签，JSON AST 始终释放。
+/**
+ * @brief 先构造默认配置，再读取 JSON 文件逐段覆盖并校验。
+ * @param[in] path 可选借用路径，NULL 时仅构造默认值，非 NULL 使用默认文件系统读取。
+ * @param[out] out_config 必需且无已有资源，失败也可能拥有默认或部分覆盖字段，均由调用者 destroy。
+ * @return 默认构造、文件读取、JSON、密钥引用及校验错误原样返回，字段复制失败为 CC_ERR_OUT_OF_MEMORY，不可表示的无符号预算为 CC_ERR_INVALID_ARGUMENT。
+ * @note 文件使用普通 JSON 入口的首值尾部兼容，字符串深拷贝。api_key_env 覆盖文件明文，api_key_ref 随后解析。并发读取环境和修改文件由外层协调。
  */
 cc_result_t cc_config_load(const char *path, cc_config_t *out_config)
 {
@@ -1174,7 +1267,7 @@ cc_result_t cc_config_load(const char *path, cc_config_t *out_config)
         }
         cc_json_value_t *v = cc_json_object_get(storage, "session_segment_bytes");
         if (!v) v = cc_json_object_get(storage, "sessionSegmentBytes");
-        if (v) out_config->session_segment_bytes = (size_t)cc_json_number_value(v);
+        if (v && !parse_size_value(v, &out_config->session_segment_bytes)) goto invalid_size;
         s = json_string_field(storage, "session_media_dir");
         if (!s) s = json_string_field(storage, "sessionMediaDir");
         if (s && !replace_string(&out_config->session_media_dir, s)) goto oom;
@@ -1262,7 +1355,7 @@ cc_result_t cc_config_load(const char *path, cc_config_t *out_config)
         s = json_string_field(system, "system_prompt");
         if (s && !replace_string(&out_config->system_prompt, s)) goto oom;
         cc_json_value_t *v = cc_json_object_get(system, "max_steps");
-        out_config->max_steps = v ? cc_json_int_value(v) : 10;
+        if (v) out_config->max_steps = cc_json_int_value(v);
 
         v = cc_json_object_get(system, "debug");
         if (v) out_config->debug_mode = json_boolish_value(v);
@@ -1322,7 +1415,9 @@ cc_result_t cc_config_load(const char *path, cc_config_t *out_config)
 
 
 
-    if (!parse_runtime_sections(out_config, root)) goto oom;
+    int section_status = parse_runtime_sections(out_config, root);
+    if (section_status < 0) goto invalid_size;
+    if (!section_status) goto oom;
     cc_result_t validation_rc = cc_config_validate(out_config);
     if (validation_rc.code != CC_OK) {
         cc_json_destroy(root);
@@ -1339,14 +1434,18 @@ cc_result_t cc_config_load(const char *path, cc_config_t *out_config)
 oom:
     cc_json_destroy(root);
     return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to allocate config field");
+
+invalid_size:
+    cc_json_destroy(root);
+    return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Config unsigned size is out of range");
 }
 
 
-/*
- * 销毁配置对象。
- *
- * config 拥有大量嵌套字符串、数组和子结构；集中释放可以避免调用方理解每个 section 的
- * 内部布局。最后 memset 清零，降低重复 destroy 的风险。
+/**
+ * @brief 释放配置全部拥有字段并清零，适用于加载成功和部分失败。
+ * @param[in,out] config 可选有效配置，计数须覆盖可释放数组槽，字段需独立拥有。
+ * @post 非 NULL 配置归零，可再次 destroy，旧字段借用全部失效。
+ * @pre 外层已排空配置及字段的并发读者，不与 load、builder 读取等重叠。
  */
 void cc_config_destroy(cc_config_t *config)
 {
@@ -1403,11 +1502,12 @@ void cc_config_destroy(cc_config_t *config)
 }
 
 
-/*
- * 构建 system prompt。
- *
- * 优先使用 config->system_prompt；否则读取 soul/user 文件并拼接；仍为空时回退到内置
- * 默认提示词。返回字符串由调用方 free()。
+/**
+ * @brief 复制显式提示词，或拼接可读 soul/user 文件，再按需采用内置提示词。
+ * @param[in] config 必需借用配置，字段在同步读取期间保持稳定。
+ * @param[out] out_prompt 必需空资源输出，基础参数合法后置 NULL，成功正文由调用者 free。
+ * @return 成功为 CC_OK，空参数为 CC_ERR_INVALID_ARGUMENT，复制、builder 或默认正文分配错误返回对应错误。
+ * @note 文件读取错误在 helper 消费，允许继续其他来源，append 失败回收缓冲并传回拥有错误结果。
  */
 cc_result_t cc_config_build_system_prompt(const cc_config_t *config, char **out_prompt)
 {
@@ -1433,17 +1533,25 @@ cc_result_t cc_config_build_system_prompt(const cc_config_t *config, char **out_
 
     char *soul_content = read_text_file(config->soul_file);
     if (soul_content && strlen(soul_content) > 0) {
-        cc_string_builder_append(&sb, soul_content);
-        cc_string_builder_append(&sb, "\n\n");
+        builder_rc = cc_string_builder_append(&sb, soul_content);
+        if (builder_rc.code == CC_OK) builder_rc = cc_string_builder_append(&sb, "\n\n");
     }
     free(soul_content);
+    if (builder_rc.code != CC_OK) {
+        cc_string_builder_deinit(&sb);
+        return builder_rc;
+    }
 
     char *user_content = read_text_file(config->user_file);
     if (user_content && strlen(user_content) > 0) {
-        cc_string_builder_append(&sb, user_content);
-        cc_string_builder_append(&sb, "\n\n");
+        builder_rc = cc_string_builder_append(&sb, user_content);
+        if (builder_rc.code == CC_OK) builder_rc = cc_string_builder_append(&sb, "\n\n");
     }
     free(user_content);
+    if (builder_rc.code != CC_OK) {
+        cc_string_builder_deinit(&sb);
+        return builder_rc;
+    }
 
 
 

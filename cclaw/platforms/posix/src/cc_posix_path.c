@@ -5,38 +5,48 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <unistd.h>
 
+/**
+ * @brief 识别以斜杠开始的 POSIX 绝对路径。
+ * @param[in] path 借用路径，可为 NULL。
+ * @return 首字节为斜杠返回 1，其余返回 0。
+ */
 static int is_absolute_path(const char *path)
 {
     return path && path[0] == '/';
 }
 
-/*
- * 对不存在的路径做词法归一化。
- *
- * realpath 要求目标存在；写文件工具需要在目标文件尚不存在时检查 parent/workspace 边界。
- * 这里把相对路径转成基于 cwd 的绝对路径，再手工处理 "." 和 ".."，但不解析符号链接。
+/**
+ * @brief 基于当前 cwd 生成绝对路径并词法折叠点段及多余斜杠。
+ * @param[in] path 非空借用路径，相对形式需要 getcwd 成功。
+ * @return 返回调用方 free 的绝对路径，空输入、PATH_MAX 或段数超限、cwd 或分配失败返回 NULL。
+ * @note 不查询组件是否存在，不解析符号链接，调用者协调进程 cwd 的并发修改。
  */
 static char *normalize_absolute_path(const char *path)
 {
     if (!path || !path[0]) return NULL;
 
     char input[PATH_MAX];
+    int written;
     if (is_absolute_path(path)) {
-        if (snprintf(input, sizeof(input), "%s", path) >= (int)sizeof(input)) {
+        written = snprintf(input, sizeof(input), "%s", path);
+        if (written < 0 || (size_t)written >= sizeof(input)) {
             return NULL;
         }
     } else {
         char cwd[PATH_MAX];
         if (!getcwd(cwd, sizeof(cwd))) return NULL;
-        if (snprintf(input, sizeof(input), "%s/%s", cwd, path) >= (int)sizeof(input)) {
+        written = snprintf(input, sizeof(input), "%s/%s", cwd, path);
+        if (written < 0 || (size_t)written >= sizeof(input)) {
             return NULL;
         }
     }
 
     char work[PATH_MAX];
-    if (snprintf(work, sizeof(work), "%s", input) >= (int)sizeof(work)) {
+    written = snprintf(work, sizeof(work), "%s", input);
+    if (written < 0 || (size_t)written >= sizeof(work)) {
         return NULL;
     }
 
@@ -71,10 +81,12 @@ static char *normalize_absolute_path(const char *path)
     return cc_copy_string(out);
 }
 
-/*
- * 拼接 base 和 child。
- *
- * 函数只做平台分隔符拼接，不做 canonical 或安全检查；安全边界由 cc_path_is_within 负责。
+/**
+ * @brief 拼接非空相对 child，绝对 child 直接覆盖 base。
+ * @param[in] base 借用基路径，NULL 或空时复制 child。
+ * @param[in] child 借用子路径，NULL 或空时复制非空 base，两者均无内容时按现有复制规则返回。
+ * @return 成功返回调用方 free 的字符串，双 NULL、长度溢出或分配失败返回 NULL。
+ * @note 只进行分隔符拼接，不固定目标文件系统对象，不能代替根约束 I/O。
  */
 char *cc_path_join(const char *base, const char *child)
 {
@@ -84,9 +96,11 @@ char *cc_path_join(const char *base, const char *child)
 
     size_t base_len = strlen(base);
     size_t child_len = strlen(child);
+    if (base_len > SIZE_MAX - child_len || base_len + child_len == SIZE_MAX) return NULL;
     int has_slash = (base_len > 0 && base[base_len - 1] == '/');
 
-    if (base_len > (size_t)-1 - child_len - (has_slash ? 1 : 2)) {
+    size_t padding = has_slash ? 1 : 2;
+    if (base_len + child_len > SIZE_MAX - padding) {
         return NULL;
     }
 
@@ -101,11 +115,11 @@ char *cc_path_join(const char *base, const char *child)
     return result;
 }
 
-/*
- * 获取 canonical path。
- *
- * 目标存在时使用 realpath 解析符号链接；目标不存在时退回词法归一化，保证写入前也能做
- * workspace prefix 检查。
+/**
+ * @brief 优先解析目标或直接父目录的真实路径，失败后提供词法绝对化结果。
+ * @param[in] path 非空借用路径，可为相对路径，由调用者协调 cwd 变更。
+ * @return 返回调用方 free 的规范化字符串，空输入、容量限制或分配失败返回 NULL。
+ * @note 目标及直接父目录均无法 realpath 时采用词法回退，不能保证解析更远祖先的符号链接。
  */
 char *cc_path_canonical(const char *path)
 {
@@ -135,11 +149,12 @@ char *cc_path_canonical(const char *path)
     return normalize_absolute_path(path);
 }
 
-/*
- * 判断 path 是否位于 base_dir 内。
- *
- * 两边先 canonical，再做 prefix + 路径分隔符检查，避免 "/tmp/ws2" 被误判为 "/tmp/ws"
- * 内部路径。base_dir 为 "/" 时，任意绝对 canonical 路径都在其内。
+/**
+ * @brief 分别规范化根与目标，按完整组件前缀判断同根或位于根下。
+ * @param[in] base_dir 借用根路径，NULL 或无法规范化时返回 0。
+ * @param[in] path 借用目标路径，NULL 或无法规范化时返回 0。
+ * @return 同根或根内返回 1，其余返回 0，根为斜杠时接受所有规范化绝对路径。
+ * @note 两次解析之间不持有文件系统对象，链接或目录并发变化以及 canonical 词法回退仍需根约束 I/O 处理。
  */
 int cc_path_is_within(const char *base_dir, const char *path)
 {
@@ -168,10 +183,10 @@ int cc_path_is_within(const char *base_dir, const char *path)
     return result;
 }
 
-/*
- * 返回路径的父目录。
- *
- * 根目录返回 "/"；没有斜杠的相对文件返回 "."；空路径返回 NULL。
+/**
+ * @brief 词法取得父目录，先移除非根路径末尾的斜杠。
+ * @param[in] path 借用的非空路径。
+ * @return 返回调用方 free 的父目录，根返回斜杠，无斜杠返回点，空输入或分配失败返回 NULL。
  */
 char *cc_path_dirname(const char *path)
 {
@@ -199,7 +214,11 @@ char *cc_path_dirname(const char *path)
     return cc_copy_string(".");
 }
 
-/* 判断路径是否存在；POSIX 实现使用 access(F_OK)。 */
+/**
+ * @brief 使用 access 查询路径是否可确认存在。
+ * @param[in] path 借用路径，NULL 或空返回 0。
+ * @return access 成功返回 1，其他情况返回 0，包括不存在和访问失败。
+ */
 int cc_path_exists(const char *path)
 {
     if (!path || !path[0]) return 0;

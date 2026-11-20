@@ -1,7 +1,8 @@
-
-
-
-
+# 核心 SDK 的默认编译预设，由 cclaw/CMakeLists.txt include，无自定义函数。
+# 保留同步 runtime、内存及 JSON 会话和 streaming 编译路径，应用提供模型等实际依赖。
+# 文件/HTTP 工具、长期记忆、多模态、队列/工具池、进程扩展和 SQLite 默认关闭。
+# 分段会话等未列项由根 cc_profile_default 补齐，最终源码由 CC_ENABLE_* 条件决定。
+# 普通 profile 的值用于首次 option 缺省，已有 CMake cache 可覆盖并经根依赖规则检查。
 set(CC_PROFILE_TARGET_PLATFORM auto)
 
 
@@ -41,10 +42,11 @@ set(CC_PROFILE_ENABLE_SESSION_STORE_JSON_FILE ON)
 set(CC_PROFILE_ENABLE_SESSION_STORE_SQLITE OFF)
 
 
+# 宿主缺省数据位于当前构建目录，未给出的会话路径由根按启用后端派生。
+# 空配置和提示词路径表示无预设文件，运行期调用者仍可提供自己的配置。
 set(CC_PROFILE_DEFAULT_CONFIG_PATH "")
 set(CC_PROFILE_DEFAULT_DATA_DIR "${CMAKE_BINARY_DIR}/runtime/data")
 set(CC_PROFILE_DEFAULT_WORKSPACE_PATH "${CMAKE_BINARY_DIR}/runtime/workspace")
-set(CC_PROFILE_DEFAULT_STORAGE_PATH "${CMAKE_BINARY_DIR}/runtime/data/sessions")
 set(CC_PROFILE_DEFAULT_MEMORY_PATH "${CMAKE_BINARY_DIR}/runtime/data/memory.json")
 set(CC_PROFILE_DEFAULT_SOUL_FILE "")
 set(CC_PROFILE_DEFAULT_USER_FILE "")

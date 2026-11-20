@@ -4,6 +4,7 @@
 
 #include "cc/ports/cc_storage_factory.h"
 #include "cc/ports/cc_platform.h"
+#include "cc/adapters/cc_json_file_session_store.h"
 #include <string.h>
 
 #ifndef CC_DEFAULT_STORAGE_PATH
@@ -14,31 +15,27 @@
 #define CC_DEFAULT_JSON_FILE_STORAGE_PATH "runtime/data/sessions.json"
 #endif
 
-/*
- * 下方 create 函数由各存储 adapter 实现。
- *
- * 这里用编译宏包住声明，避免在裁剪 profile 中引用未编译的后端。嵌入式 SDK 常用这种
- * “能力宏 + 工厂函数”的方式把 SQLite/文件系统等重量依赖从 MCU profile 中剔除。
- */
+/** @brief 各后端声明跟随裁剪宏，未编译后端的选择返回 UNSUPPORTED。 */
 #if CC_STORAGE_SQLITE
 
-/*
- * SQLite session store 前向声明，由 cc_sqlite_session_store.c 实现。
- * 参数: db_path - 数据库文件路径, out_store - 输出 store 句柄
+/**
+ * @brief 打开或创建 SQLite 会话库，具体初始化和失败清理由后端实现。
+ * @param[in] db_path 调用期间借用数据库路径，NULL 使用 SQLite 后端默认值。
+ * @param[out] out_store 新拥有槽，成功交付后由调用者排空并 destroy。
+ * @return 后端创建结果，失败不转交实例，拥有诊断交调用者。
  */
 cc_result_t cc_sqlite_session_store_create(const char *db_path, cc_session_store_t *out_store);
 #endif
 
-/*
- * JSON 单文件 session store 前向声明，由 cc_json_file_store.c 实现。
- * 参数: file_path - JSON 文件路径, out_store - 输出 store 句柄
- */
-#if CC_STORAGE_JSON_FILE
-cc_result_t cc_json_file_store_create(const char *file_path, cc_session_store_t *out_store);
-/*
- * JSON 分段存储 session store 前向声明，由 cc_json_segmented_store.c 实现。
- * 参数: root_path - 根目录路径, segment_bytes - 分段大小阈值, media_dir - 媒体子目录名,
- *        max_base64_bytes - 最大 base64 内联大小, out_store - 输出 store 句柄
+#if CC_STORAGE_JSON_SEGMENTED
+/**
+ * @brief 创建 JSON 分段会话后端，恢复与路径检查由该后端完成。
+ * @param[in] root_path 调用期借用根目录，本工厂已选择配置值或编译默认值。
+ * @param[in] segment_bytes 分段字节阈值，零值由后端解释。
+ * @param[in] media_dir 调用期借用媒体子目录，可为 NULL，默认由后端选择。
+ * @param[in] max_base64_bytes 上下文媒体编码字节预算，零值由后端解释。
+ * @param[out] out_store 新拥有槽，成功后由调用者排空并 destroy。
+ * @return 后端创建结果，失败不转交实例，拥有诊断交调用者。
  */
 cc_result_t cc_json_segmented_store_create(
     const char *root_path,
@@ -49,31 +46,35 @@ cc_result_t cc_json_segmented_store_create(
 );
 #endif
 
-/*
- * 纯内存 session store 前向声明，由 cc_memory_session_store.c 实现。
- * 参数: out_store - 输出 store 句柄
- */
 #if CC_STORAGE_MEMORY
+/**
+ * @brief 创建带内部 mutex 的内存会话后端。
+ * @param[out] out_store 新拥有槽，成功后由调用者排空并 destroy。
+ * @return 后端创建结果，失败归还局部资源，拥有诊断交调用者。
+ */
 cc_result_t cc_memory_session_store_create(cc_session_store_t *out_store);
 #endif
 
-/*
- * 根据配置创建 session store。
- *
- * out_store 由调用方提供，成功后获得后端 self/vtable；销毁通过 vtable->destroy 完成。
- * storage_type 支持 memory/local_file/json/sqlite。SQLite 创建失败时当前策略降级到 JSON，
- * 这是运行时可用性优先的取舍；如果产品要求 fail-fast，可以在上层配置策略中收紧。
+/**
+ * @brief 按准确配置名称选择一个已编译的会话后端并交付其拥有实例。
+ * @param[in] config 非 NULL 调用期稳定配置，字符串只在创建期间借用。
+ * @param[out] out_store 必填新拥有槽，先清零，成功后调用者排空并通过 vtable destroy。
+ * @return 成功为 CC_OK，参数/未知类型为 INVALID_ARGUMENT，禁用后端为 UNSUPPORTED，创建失败原样返回。
+ * @note local_file/json 均选择单文件 JSON，json_segmented 使用分段目录。
+ * SQLite 失败直接上报，后端负责局部清理，工厂不执行跨后端回退或 BSP 挂载。
  */
 cc_result_t cc_storage_factory_create_store(
     const cc_config_t *config,
     cc_session_store_t *out_store
 )
 {
-    if (!config || !out_store)
+    if (!out_store)
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null config or out_store");
 
 
     memset(out_store, 0, sizeof(cc_session_store_t));
+    if (!config)
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null config or out_store");
 
 
     if (config->storage_type && strcmp(config->storage_type, "memory") == 0) {
@@ -106,7 +107,7 @@ cc_result_t cc_storage_factory_create_store(
 
 
     if (config->storage_type && strcmp(config->storage_type, "json_segmented") == 0) {
-#if CC_STORAGE_JSON_FILE
+#if CC_STORAGE_JSON_SEGMENTED
         const char *path = config->storage_path ? config->storage_path : CC_DEFAULT_STORAGE_PATH;
         return cc_json_segmented_store_create(
             path,

@@ -1,3 +1,8 @@
+# 完整媒体结构 SDK 预设，启用图像/音频/视频/文件、媒体输出、内联 Base64 与产物库。
+# 文件工具、streaming、内存和 JSON 会话默认启用，长期记忆和三 provider默认关闭。
+# 媒体编译能力、应用模型能力声明和实际后端支持分别由根规则及运行期配置核对。
+# auto 平台交根解析，普通预设为首次 option 提供缺省，已有 cache 可显式覆盖。
+# 本文件只有配置期赋值，无自定义函数及运行期资源。
 set(CC_PROFILE_TARGET_PLATFORM auto)
 
 
@@ -37,10 +42,11 @@ set(CC_PROFILE_ENABLE_SESSION_STORE_MEMORY ON)
 set(CC_PROFILE_ENABLE_SESSION_STORE_JSON_FILE ON)
 set(CC_PROFILE_ENABLE_SESSION_STORE_SQLITE OFF)
 
+# 宿主缺省数据和工作区位于当前构建目录，会话路径由根按启用后端派生。
+# memory.json 是编译默认路径，实际长期记忆装配仍受 CC_ENABLE_MEMORY 控制。
 set(CC_PROFILE_DEFAULT_CONFIG_PATH "")
 set(CC_PROFILE_DEFAULT_DATA_DIR "${CMAKE_BINARY_DIR}/runtime/data")
 set(CC_PROFILE_DEFAULT_WORKSPACE_PATH "${CMAKE_BINARY_DIR}/runtime/workspace")
-set(CC_PROFILE_DEFAULT_STORAGE_PATH "${CMAKE_BINARY_DIR}/runtime/data/sessions")
 set(CC_PROFILE_DEFAULT_MEMORY_PATH "${CMAKE_BINARY_DIR}/runtime/data/memory.json")
 set(CC_PROFILE_DEFAULT_SOUL_FILE "")
 set(CC_PROFILE_DEFAULT_USER_FILE "")

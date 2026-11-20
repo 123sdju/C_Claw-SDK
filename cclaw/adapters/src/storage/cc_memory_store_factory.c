@@ -3,6 +3,7 @@
 
 
 #include "cc/ports/cc_memory_store.h"
+#include "cc/ports/cc_memory_tool_factory.h"
 #include "cc/ports/cc_platform.h"
 #include <stdlib.h>
 #include <string.h>
@@ -11,45 +12,38 @@
 #define CC_DEFAULT_MEMORY_PATH "runtime/data/memory.json"
 #endif
 
-/*
- * no-op memory store factory。
- *
- * 在不支持长期记忆的平台上返回稳定错误，而不是构造一个会静默丢数据的 store。上层
- * runtime builder 会把该错误视作可降级能力，保持核心 agent 仍可启动。
+/**
+ * @brief 清空输出并显式报告平台禁用记忆存储。
+ * @param[out] out_store 必需新描述符，入口清零，失败保持空。
+ * @return NULL 输出为 INVALID_ARGUMENT，其余为 PLATFORM，拥有诊断由调用方释放。
  */
 cc_result_t cc_memory_store_create_noop(cc_memory_store_t *out_store)
 {
-    (void)out_store;
+    if (!out_store) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null memory store output");
+    memset(out_store, 0, sizeof(*out_store));
     return cc_result_error(CC_ERR_PLATFORM, "Memory store disabled on this platform");
 }
 
-/* 内存 memory store 后端总是轻量可用，适合测试和裁剪 profile。 */
+/** @brief 创建内存记忆后端。 @param[out] out_store 必需新描述符，成功 self 由调用者销毁。 @return 参数、分配或成功拥有结果。 */
 cc_result_t cc_memory_store_create_inmem(cc_memory_store_t *out_store);
 
-/*
- * JSON/SQLite 后端按编译宏声明。
- *
- * 这样 MCU/RTOS profile 可以不链接文件系统或 SQLite 依赖，而 desktop profile 仍能启用
- * 持久化记忆。
- */
-#if CC_STORAGE_JSON_FILE
+/* 持久化后端按当前功能宏引用，工厂自身只选择后端及默认路径。 */
+#if CC_MEMORY_STORE_JSON_FILE
+/** @brief 创建 JSON 文件后端。 @param[out] out_store 必需新描述符，成功对象由调用者销毁。 @param[in] file_path 调用期路径借用，后端复制配置。 @return 参数、文件、分配或成功拥有结果。 */
 cc_result_t cc_memory_store_create_json_file(cc_memory_store_t *out_store, const char *file_path);
 #endif
 #if CC_STORAGE_SQLITE
 
-/*
- * SQLite 后端的 memory store 前向声明，由 cc_sqlite_memory_store.c 实现。
- * 参数: out_store - 输出 store 句柄, db_path - SQLite 数据库路径
- */
+/** @brief 创建 SQLite 记忆后端。 @param[out] out_store 必需新描述符，成功对象由调用者销毁。 @param[in] db_path 调用期路径借用。 @return 参数、数据库、分配或成功拥有结果。 */
 cc_result_t cc_memory_store_create_sqlite(cc_memory_store_t *out_store, const char *db_path);
 #endif
 
-/*
- * 根据 backend 名称创建 memory store。
- *
- * out_store 成功后持有后端 self/vtable；backend 支持 inmem/json_file/sqlite/noop/none。
- * path 为空时使用默认路径。该工厂只选择后端，不把 embedding/vector 能力强塞进 core，
- * 仍然保持 memory query port 与具体检索实现解耦。
+/**
+ * @brief 按精确后端名选择工厂，直接交付创建结果。
+ * @param[out] out_store 必需新描述符，入口清零，成功后拥有后端，调用方最终 destroy。
+ * @param[in] backend 必需调用期借用，支持 inmem、json_file、sqlite、noop 和 none。
+ * @param[in] path 调用期可选路径借用，NULL 时持久化后端使用 CC_DEFAULT_MEMORY_PATH，空串交后端解释。
+ * @return 参数错误、已禁用后端错误或后端拥有结果，指定后端失败直接返回，诊断由调用方释放。
  */
 cc_result_t cc_memory_store_factory_create(
     cc_memory_store_t *out_store,
@@ -57,13 +51,14 @@ cc_result_t cc_memory_store_factory_create(
     const char *path
 )
 {
+    if (out_store) memset(out_store, 0, sizeof(*out_store));
     if (!out_store || !backend)
         return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid factory arguments");
 
     if (strcmp(backend, "inmem") == 0)
         return cc_memory_store_create_inmem(out_store);
     if (strcmp(backend, "json_file") == 0) {
-#if CC_STORAGE_JSON_FILE
+#if CC_MEMORY_STORE_JSON_FILE
         return cc_memory_store_create_json_file(out_store, path ? path : CC_DEFAULT_MEMORY_PATH);
 #else
         return cc_result_error(CC_ERR_UNSUPPORTED, "JSON file memory backend disabled in this build");

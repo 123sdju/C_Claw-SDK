@@ -3,7 +3,6 @@
 
 
 #include "cc/app/cc_agent_runtime.h"
-#include "cc/internal/cc_alloc.h"
 #include "cc/ports/cc_thread.h"
 #include "cc/internal/cc_alloc.h"
 
@@ -14,26 +13,33 @@
 #define THREADS 4
 
 
-/*
- * 函数 cc_memory_session_store_create：声明 cclaw/tests/core/test_runtime_concurrent_sessions.c 中的 memory session store create 相关逻辑。
- *
- * 注释用于标明函数职责边界；参数校验、资源所有权、并发限制和错误码语义以函数体
- * 及对应头文件契约为准，后续维护应在修改行为时同步更新这里和项目文档。
+/**
+ * @brief 创建主线程拥有的内存会话库。
+ * @param[out] out_store 新端口槽，成功以 vtable.destroy 回收。
+ * @return 构造状态及拥有诊断，调用者消费。
  */
 extern cc_result_t cc_memory_session_store_create(cc_session_store_t *out_store);
 
-/* fake LLM：直接返回文本，避免测试依赖真实 provider。 */
+/**
+ * @brief 按请求思考模式生成独立文本响应。
+ * @param[in] self 未使用状态借用。
+ * @param[in] request 同步请求借用，各线程独立请求。
+ * @param[out] out 独占新响应槽，文本副本交 runtime 清理。
+ * @return 文本构造状态，OOM 传播，无共享可变状态。
+ */
 static cc_result_t fake_chat(void *self, const cc_llm_chat_request_t *request, cc_llm_response_t *out)
 {
     (void)self;
-    memset(out, 0, sizeof(*out));
-    out->has_text = 1;
+    cc_llm_response_init(out);
     out->finished = 1;
-    out->text = cc_copy_string(request->thinking_mode ? "thinking-ok" : "ok");
-    return cc_result_ok();
+    return cc_llm_response_set_text(out, request->thinking_mode ? "thinking-ok" : "ok");
 }
 
-/* fake provider destroy，无私有状态。 */
+/**
+ * @brief 接收无私有资源 provider 的销毁调用。
+ * @param[in] self 未使用借用，可 NULL，不释放外部状态。
+ * @return 无返回值，无动态对象。
+ */
 static void fake_destroy(void *self) { (void)self; }
 
 /* fake provider vtable，只需要同步 chat。 */
@@ -50,11 +56,10 @@ typedef struct {
     int failed;
 } runtime_ctx_t;
 
-/*
- * 并发 worker。
- *
- * 每个线程创建自己的 session 并执行一次 handle_message，用来验证 runtime/store 的多会话
- * 并发边界。
+/**
+ * @brief 在共享 runtime 创建独立会话并核对一次答案。
+ * @param[in,out] arg 独占 runtime_ctx_t 借用，runtime 覆盖线程期，failed 仅本线程写。
+ * @return NULL，答案与结果诊断在本线程释放，主线程 join 后读取 failed。
  */
 static void *worker(void *arg)
 {
@@ -72,21 +77,30 @@ static void *worker(void *arg)
     return NULL;
 }
 
-/*
- * 验证 runtime 可以并发处理多个 session。
- *
- * 重点覆盖共享 runtime、共享 tool registry 和内存 session store 在多线程下不会串话或崩溃。
+/**
+ * @brief 启动四个会话线程，核对每个答案并在排空后销毁共享依赖。
+ * @return 全部构造、线程操作及答案检查成功零，否则一，成功/部分启动路径回收已建资源。
+ * @note registry 先冻结，线程各有结果槽，runtime/store 保持到已启动线程全部 join。
  */
 int main(void)
 {
     cc_tool_registry_t *registry = NULL;
-    cc_session_store_t store;
+    cc_session_store_t store = {0};
     cc_agent_runtime_t *runtime = NULL;
 
 
-    if (cc_tool_registry_create(&registry).code != CC_OK) return 1;
-    cc_tool_registry_freeze(registry);
-    if (cc_memory_session_store_create(&store).code != CC_OK) return 1;
+    cc_result_t rc = cc_tool_registry_create(&registry);
+    int failed = rc.code != CC_OK;
+    cc_result_free(&rc);
+    if (failed) return 1;
+    rc = cc_tool_registry_freeze(registry);
+    failed = rc.code != CC_OK;
+    cc_result_free(&rc);
+    if (failed) { cc_tool_registry_destroy(registry); return 1; }
+    rc = cc_memory_session_store_create(&store);
+    failed = rc.code != CC_OK;
+    cc_result_free(&rc);
+    if (failed) { cc_tool_registry_destroy(registry); return 1; }
 
 
     cc_llm_provider_t llm = { NULL, &fake_vtable };
@@ -96,7 +110,8 @@ int main(void)
         .max_steps = 2,
         .system_prompt = "system",
         .workspace_dir = ".",
-        .model = "fake"
+        .model = "fake",
+        .limits = { .size = sizeof(cc_runtime_limits_t), .max_concurrency = THREADS }
     };
     cc_agent_runtime_deps_t deps;
     memset(&deps, 0, sizeof(deps));
@@ -108,22 +123,34 @@ int main(void)
     cc_agent_runtime_options_t options;
     memset(&options, 0, sizeof(options));
     options.config = config;
-    if (cc_agent_runtime_create(&deps, &options, &runtime).code != CC_OK) return 1;
+    rc = cc_agent_runtime_create(&deps, &options, &runtime);
+    failed = rc.code != CC_OK;
+    cc_result_free(&rc);
+    if (failed) { store.vtable->destroy(store.self); cc_tool_registry_destroy(registry); return 1; }
 
 
     runtime_ctx_t ctx[THREADS];
     cc_thread_t threads[THREADS];
+    int started = 0;
     for (int i = 0; i < THREADS; i++) {
         ctx[i].runtime = runtime;
         ctx[i].index = i;
         ctx[i].failed = 0;
-        cc_thread_create(worker, &ctx[i], &threads[i]);
+        rc = cc_thread_create(worker, &ctx[i], &threads[i]);
+        failed = rc.code != CC_OK;
+        cc_result_free(&rc);
+        if (failed) break;
+        started++;
     }
-    for (int i = 0; i < THREADS; i++) cc_thread_join(threads[i]);
+    for (int i = 0; i < started; i++) {
+        rc = cc_thread_join(threads[i]);
+        int joined = rc.code == CC_OK;
+        cc_result_free(&rc);
+        if (!joined) return 1;
+    }
 
 
-    int failed = 0;
-    for (int i = 0; i < THREADS; i++) failed |= ctx[i].failed;
+    for (int i = 0; i < started; i++) failed |= ctx[i].failed;
 
     cc_agent_runtime_destroy(runtime);
     store.vtable->destroy(store.self);

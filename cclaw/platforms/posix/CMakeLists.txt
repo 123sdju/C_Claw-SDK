@@ -67,3 +67,8 @@ endif()
 
 set(CC_PLATFORM_PUBLIC_INCLUDE_DIRS ${CC_PLATFORM_PUBLIC_INCLUDE_DIRS} PARENT_SCOPE)
 set(CC_PLATFORM_PUBLIC_LIBRARIES ${CC_PLATFORM_PUBLIC_LIBRARIES} PARENT_SCOPE)
+#[[
+  @file 组装 POSIX 平台对象，按功能加入进程及 HTTP 实现。
+  HTTP 优先使用系统 CURL imported target，手工定位静态库时由调用者补齐传递依赖。
+  公共库与手工包含路径经父作用域交给最终 runtime，避免对象收集丢失链接依赖。
+]]

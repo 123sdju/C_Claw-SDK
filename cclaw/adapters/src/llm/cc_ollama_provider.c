@@ -6,18 +6,37 @@
 #include "cc/adapters/cc_http_llm_provider.h"
 #include "cc/util/cc_json.h"
 #include "cc/internal/cc_alloc.h"
+#include "cc/internal/cc_json_syntax_check.h"
 #include "cc/util/cc_string_builder.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
-/*
- * 向 Ollama HTTP 请求追加 header。
- *
- * request 拥有 headers 数组和字段字符串；失败时外层通过 cc_llm_http_request_cleanup
- * 统一释放已添加资源。
+/**
+ * @brief 解析完整协议 JSON 并拒绝解码 NUL。
+ * @param[in] text 调用期 NUL 结尾文本借用，NULL 返回解析器参数错误。
+ * @param[out] out 必填树槽，存在时先清空，成功交付拥有树。
+ * @return 参数或 JSON 结果，失败输出为空，拥有诊断交调用者。
+ */
+static cc_result_t parse_protocol_json(const char *text, cc_json_value_t **out)
+{
+    if (out) *out = NULL;
+    if (cc_storage_json_has_nul_escape(text))
+        return cc_result_error(CC_ERR_JSON, "Ollama JSON contains a decoded NUL");
+    return cc_json_parse_strict(text, out);
+}
+
+/**
+ * @brief 为本次请求扩容并复制追加一个 HTTP 头。
+ * @param[in,out] request 独占初始化请求，已有计数对应有效数组。
+ * @param[in] name 有效调用期名称借用。
+ * @param[in] value 可选调用期值借用，NULL 复制为空串。
+ * @return CC_OK 或 OOM，失败保留可清理部分项，外层统一 cleanup。
  */
 static cc_result_t add_header(cc_llm_http_request_t *request, const char *name, const char *value)
 {
+    if (request->header_count >= SIZE_MAX / sizeof(cc_http_header_t))
+        return cc_result_error(CC_ERR_LIMIT_EXCEEDED, "Too many Ollama HTTP headers");
     cc_http_header_t *headers = realloc(
         request->headers,
         sizeof(cc_http_header_t) * (request->header_count + 1));
@@ -32,33 +51,33 @@ static cc_result_t add_header(cc_llm_http_request_t *request, const char *name, 
     return cc_result_ok();
 }
 
-/* 返回协议名；通用 HTTP provider 用它标记本地 Ollama 的能力。 */
+/** @brief 提供能力映射的协议名。 @param[in] self 未使用，可为 NULL。 @return 静态 ollama 名称借用。 */
 static const char *ollama_name(void *self)
 {
     (void)self;
     return "ollama";
 }
 
-/*
- * 克隆 JSON 节点。
- *
- * 用序列化再解析的方式避免直接移动源 AST 节点，保持消息转换过程的所有权清晰。
+/**
+ * @brief 序列化再解析以创建独立树副本。
+ * @param[in] value 调用期间借用源节点，原树拥有权保留。
+ * @return 拥有副本或 NULL，调用者挂接或销毁，临时文本归还。
  */
 static cc_json_value_t *json_clone_value(const cc_json_value_t *value)
 {
     char *json = cc_json_stringify_unformatted(value);
     if (!json) return NULL;
     cc_json_value_t *copy = NULL;
-    cc_json_parse(json, &copy);
+    cc_result_t rc = parse_protocol_json(json, &copy);
+    cc_result_free(&rc);
     free(json);
     return copy;
 }
 
-/*
- * 为 Ollama 不支持直接使用的多模态 part 生成文本描述。
- *
- * Ollama chat 原生主要支持文本和图片 base64；其它资源保留为 fallback 文本，避免上下文
- * 静默缺失。
+/**
+ * @brief 将非内联图片或其他资源元数据转成文本。
+ * @param[in] part 调用期资源借用，读取身份、MIME、路径和正尺寸等字段。
+ * @return 拥有文本或 NULL，调用者 free。
  */
 static char *ollama_describe_part(const cc_json_value_t *part)
 {
@@ -72,108 +91,141 @@ static char *ollama_describe_part(const cc_json_value_t *part)
     double duration_ms = cc_json_number_value(cc_json_object_get(part, "duration_ms"));
 
     cc_string_builder_t sb;
-    if (cc_string_builder_init(&sb).code != CC_OK) return cc_copy_string("[multimodal artifact]");
-    cc_string_builder_appendf(&sb, "[ollama multimodal fallback: type=%s",
-        type ? type : "file");
-    if (id && *id) cc_string_builder_appendf(&sb, " id=%s", id);
-    if (mime && *mime) cc_string_builder_appendf(&sb, " mime=%s", mime);
-    if (path && *path) cc_string_builder_appendf(&sb, " path=%s", path);
-    if (bytes > 0) cc_string_builder_appendf(&sb, " bytes=%.0f", bytes);
-    if (width > 0 && height > 0) cc_string_builder_appendf(&sb, " size=%.0fx%.0f", width, height);
-    if (duration_ms > 0) cc_string_builder_appendf(&sb, " duration_ms=%.0f", duration_ms);
-    cc_string_builder_append(&sb, " multimodal_fallback=true]");
+    cc_result_t rc = cc_string_builder_init(&sb);
+    if (rc.code == CC_OK) rc = cc_string_builder_appendf(&sb, "[ollama multimodal fallback: type=%s", type ? type : "file");
+    if (rc.code == CC_OK && id && *id) rc = cc_string_builder_appendf(&sb, " id=%s", id);
+    if (rc.code == CC_OK && mime && *mime) rc = cc_string_builder_appendf(&sb, " mime=%s", mime);
+    if (rc.code == CC_OK && path && *path) rc = cc_string_builder_appendf(&sb, " path=%s", path);
+    if (rc.code == CC_OK && bytes > 0) rc = cc_string_builder_appendf(&sb, " bytes=%.0f", bytes);
+    if (rc.code == CC_OK && width > 0 && height > 0) rc = cc_string_builder_appendf(&sb, " size=%.0fx%.0f", width, height);
+    if (rc.code == CC_OK && duration_ms > 0) rc = cc_string_builder_appendf(&sb, " duration_ms=%.0f", duration_ms);
+    if (rc.code == CC_OK) rc = cc_string_builder_append(&sb, " multimodal_fallback=true]");
+    int success = rc.code == CC_OK;
+    cc_result_free(&rc);
+    if (!success) { cc_string_builder_deinit(&sb); return NULL; }
     return cc_string_builder_take(&sb);
 }
 
-/* 向 prompt 文本追加一个 part，多个 part 之间用换行分隔。 */
-static void ollama_append_part_text(cc_string_builder_t *sb, const char *text)
+/**
+ * @brief 把一个非空文本项用换行连接到已有文本。
+ * @param[in,out] sb 有效独占 builder。
+ * @param[in] text 可选调用期文本借用，NULL 或空串跳过。
+ * @return 追加结果，成功后 builder 拥有文本副本，调用者消费诊断并最终 deinit 或 take。
+ */
+static cc_result_t ollama_append_part_text(cc_string_builder_t *sb, const char *text)
 {
-    if (!text || !*text) return;
-    if (sb->length > 0) cc_string_builder_append(sb, "\n");
-    cc_string_builder_append(sb, text);
+    if (!text || !*text) return cc_result_ok();
+    cc_result_t rc = cc_result_ok();
+    if (sb->length > 0) rc = cc_string_builder_append(sb, "\n");
+    if (rc.code != CC_OK) return rc;
+    return cc_string_builder_append(sb, text);
 }
 
-/*
- * 将 SDK message 转成 Ollama message。
- *
- * content parts 中 text 被合并成 content 字符串，inline image base64 放入 images 数组；
- * tool_call_id/reasoning/tool_calls 尽量透传，便于兼容支持工具调用的 Ollama 模型。
+/**
+ * @brief 转换一条 SDK 消息的文本、内联图片与工具字段。
+ * @param[in] msg 调用期源节点借用，角色缺失时采用 user。
+ * @return 拥有目标对象或失败 NULL，文本项合并为 content，图片 base64 放入 images。
  */
 static cc_json_value_t *ollama_transform_message(const cc_json_value_t *msg)
 {
     cc_json_value_t *out = cc_json_create_object();
     const char *role = cc_json_string_value(cc_json_object_get(msg, "role"));
-    cc_json_object_set(out, "role", cc_json_create_string(role ? role : "user"));
+    if (!out || !cc_json_object_set_owned(out, "role", cc_json_create_string(role ? role : "user"))) goto fail;
 
     cc_json_value_t *content = cc_json_object_get(msg, "content");
     if (content && cc_json_is_array(content)) {
         cc_string_builder_t text;
-        cc_string_builder_init(&text);
+        cc_result_t rc = cc_string_builder_init(&text);
+        if (rc.code != CC_OK) { cc_result_free(&rc); goto fail; }
         cc_json_value_t *images = cc_json_create_array();
+        if (!images) { cc_string_builder_deinit(&text); goto fail; }
         int count = cc_json_array_size(content);
         for (int i = 0; i < count; ++i) {
             cc_json_value_t *part = cc_json_array_get(content, i);
             const char *type = cc_json_string_value(cc_json_object_get(part, "type"));
             if (type && strcmp(type, "text") == 0) {
-                ollama_append_part_text(&text,
+                rc = ollama_append_part_text(&text,
                     cc_json_string_value(cc_json_object_get(part, "text")));
             } else if (type && strcmp(type, "image") == 0) {
                 const char *data = cc_json_string_value(cc_json_object_get(part, "data_base64"));
                 if (data && *data) {
-                    cc_json_array_append(images, cc_json_create_string(data));
+                    if (!cc_json_array_append_owned(images, cc_json_create_string(data)))
+                        rc = cc_result_error(CC_ERR_OUT_OF_MEMORY, "Cannot append Ollama image");
                 } else {
                     char *fallback = ollama_describe_part(part);
-                    ollama_append_part_text(&text, fallback);
+                    rc = fallback ? ollama_append_part_text(&text, fallback) :
+                        cc_result_error(CC_ERR_OUT_OF_MEMORY, "Cannot describe Ollama image");
                     free(fallback);
                 }
             } else {
                 char *fallback = ollama_describe_part(part);
-                ollama_append_part_text(&text, fallback);
+                rc = fallback ? ollama_append_part_text(&text, fallback) :
+                    cc_result_error(CC_ERR_OUT_OF_MEMORY, "Cannot describe Ollama content");
                 free(fallback);
             }
+            if (rc.code != CC_OK) {
+                cc_result_free(&rc); cc_json_destroy(images); cc_string_builder_deinit(&text); goto fail;
+            }
+            cc_result_free(&rc);
         }
-        cc_json_object_set(out, "content",
-            cc_json_create_string(cc_string_builder_cstr(&text)));
+        int content_set = cc_json_object_set_owned(out, "content", cc_json_create_string(cc_string_builder_cstr(&text)));
+        cc_string_builder_deinit(&text);
+        if (!content_set) { cc_json_destroy(images); goto fail; }
         if (cc_json_array_size(images) > 0) {
-            cc_json_object_set(out, "images", images);
+            if (!cc_json_object_set_owned(out, "images", images)) goto fail;
         } else {
             cc_json_destroy(images);
         }
-        cc_string_builder_deinit(&text);
     } else {
         const char *text = cc_json_string_value(content);
-        cc_json_object_set(out, "content", cc_json_create_string(text ? text : ""));
+        if (!cc_json_object_set_owned(out, "content", cc_json_create_string(text ? text : ""))) goto fail;
     }
 
     const char *tool_call_id = cc_json_string_value(cc_json_object_get(msg, "tool_call_id"));
-    if (tool_call_id) cc_json_object_set(out, "tool_call_id", cc_json_create_string(tool_call_id));
+    if (tool_call_id && !cc_json_object_set_owned(out, "tool_call_id", cc_json_create_string(tool_call_id))) goto fail;
     const char *reasoning = cc_json_string_value(cc_json_object_get(msg, "reasoning_content"));
-    if (reasoning) cc_json_object_set(out, "reasoning_content", cc_json_create_string(reasoning));
+    if (reasoning && !cc_json_object_set_owned(out, "reasoning_content", cc_json_create_string(reasoning))) goto fail;
     cc_json_value_t *tool_calls = cc_json_object_get(msg, "tool_calls");
     if (tool_calls) {
         cc_json_value_t *copy = json_clone_value(tool_calls);
-        if (copy) cc_json_object_set(out, "tool_calls", copy);
+        if (!copy || !cc_json_object_set_owned(out, "tool_calls", copy)) goto fail;
     }
     return out;
+fail:
+    cc_json_destroy(out);
+    return NULL;
 }
 
-/* 转换 messages 数组；输入非法时返回空数组，保持请求构造可恢复。 */
+/**
+ * @brief 按原顺序转换完整消息数组。
+ * @param[in] messages 调用期源数组借用，NULL 或非数组沿兼容路径返回空数组。
+ * @return 拥有转换数组或失败 NULL，源树继续归原 owner。
+ */
 static cc_json_value_t *ollama_transform_messages(cc_json_value_t *messages)
 {
     if (!messages || !cc_json_is_array(messages)) return cc_json_create_array();
     cc_json_value_t *out = cc_json_create_array();
+    if (!out) return NULL;
     int count = cc_json_array_size(messages);
     for (int i = 0; i < count; ++i) {
-        cc_json_array_append(out, ollama_transform_message(cc_json_array_get(messages, i)));
+        if (!cc_json_array_append_owned(out, ollama_transform_message(cc_json_array_get(messages, i)))) {
+            cc_json_destroy(out);
+            return NULL;
+        }
     }
     return out;
 }
 
-/*
- * 构造 Ollama /api/chat 请求。
- *
- * Ollama 默认本地无鉴权，stream 使用 NDJSON framing；temperature/max_tokens 写入 options。
- * tools_json 直接透传给支持工具调用的模型。
+/**
+ * @brief 构造 Ollama /api/chat 的拥有 HTTP 请求。
+ * @param[in] self 无状态协议，未使用，可为 NULL。
+ * @param[in] base_url 有效调用期地址借用，追加 /api/chat。
+ * @param[in] api_key 未使用，Ollama 此适配器不添加认证头。
+ * @param[in] default_model 有效默认模型借用，请求模型优先。
+ * @param[in] request 有效统一请求借用，消息、工具 JSON 和选项保持到返回。
+ * @param[in] stream 非零使用 NDJSON，零为整体响应。
+ * @param[in,out] out_request 有效空请求槽，入口清零，成功或部分字段交外层 cleanup。
+ * @return 构造结果与拥有诊断，失败清理临时 JSON 与请求。
  */
 static cc_result_t ollama_build_request(
     void *self,
@@ -211,9 +263,8 @@ static cc_result_t ollama_build_request(
         cc_llm_http_request_cleanup(out_request);
         return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to create Ollama request");
     }
-    cc_json_object_set(body, "model", cc_json_create_string(
-        request->model ? request->model : default_model));
-    cc_json_object_set(body, "stream", cc_json_create_bool(stream));
+    if (!cc_json_object_set_owned(body, "model", cc_json_create_string(request->model ? request->model : default_model)) ||
+        !cc_json_object_set_owned(body, "stream", cc_json_create_bool(stream))) goto oom;
 
     char *messages_text = NULL;
     rc = cc_messages_to_json(
@@ -223,32 +274,33 @@ static cc_result_t ollama_build_request(
         &messages_text);
     cc_json_value_t *messages = NULL;
     if (rc.code == CC_OK && messages_text) {
-        rc = cc_json_parse(messages_text, &messages);
+        rc = parse_protocol_json(messages_text, &messages);
     }
     free(messages_text);
-    if (rc.code == CC_OK && messages) {
-        cc_json_value_t *converted = ollama_transform_messages(messages);
-        cc_json_destroy(messages);
-        cc_json_object_set(body, "messages", converted);
-    } else {
-        cc_result_free(&rc);
-        cc_json_object_set(body, "messages", cc_json_create_array());
-    }
+    if (rc.code != CC_OK) goto error;
+    cc_json_value_t *converted = ollama_transform_messages(messages);
+    cc_json_destroy(messages);
+    if (!converted || !cc_json_object_set_owned(body, "messages", converted)) goto oom;
 
-    if (request->tools_json && strlen(request->tools_json) > 2) {
+    if (request->tools_json) {
         cc_json_value_t *tools = NULL;
-        rc = cc_json_parse(request->tools_json, &tools);
-        if (rc.code == CC_OK && tools) {
-            cc_json_object_set(body, "tools", tools);
-        } else {
-            cc_result_free(&rc);
+        rc = parse_protocol_json(request->tools_json, &tools);
+        if (rc.code != CC_OK) goto error;
+        if (!cc_json_is_array(tools)) {
+            cc_json_destroy(tools);
+            rc = cc_result_error(CC_ERR_INVALID_ARGUMENT, "Ollama tools must be a JSON array");
+            goto error;
         }
+        if (!cc_json_object_set_owned(body, "tools", tools)) goto oom;
     }
 
     cc_json_value_t *options = cc_json_create_object();
-    cc_json_object_set(options, "temperature", cc_json_create_number(request->temperature));
-    cc_json_object_set(options, "num_predict", cc_json_create_number(request->max_tokens));
-    cc_json_object_set(body, "options", options);
+    if (!options || !cc_json_object_set_owned(options, "temperature", cc_json_create_number(request->temperature)) ||
+        !cc_json_object_set_owned(options, "num_predict", cc_json_create_number(request->max_tokens))) {
+        cc_json_destroy(options);
+        goto oom;
+    }
+    if (!cc_json_object_set_owned(body, "options", options)) goto oom;
 
     out_request->body_json = cc_json_stringify_unformatted(body);
     cc_json_destroy(body);
@@ -257,13 +309,20 @@ static cc_result_t ollama_build_request(
         return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to build Ollama request");
     }
     return cc_result_ok();
+oom:
+    rc = cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to build complete Ollama request");
+error:
+    cc_json_destroy(body);
+    cc_llm_http_request_cleanup(out_request);
+    return rc;
 }
 
-/*
- * 解析 Ollama 同步响应。
- *
- * message.content 映射文本，message.reasoning_content 映射 thinking，message.tool_calls 映射
- * SDK tool calls；done 字段设置 finished。
+/**
+ * @brief 将 Ollama 同步消息转换为统一文本、推理和工具调用。
+ * @param[in] self 无状态协议，未使用，可为 NULL。
+ * @param[in] response_json 调用期间借用响应文本。
+ * @param[out] out_response 有效空资源槽，入口初始化，拥有字段由上层 cc_llm_response_free。
+ * @return 模型、JSON、字段或分配结果，拥有诊断交调用者，失败归还输出字段，成功将 done 记录到 finished。
  */
 static cc_result_t ollama_parse_response(
     void *self,
@@ -275,14 +334,12 @@ static cc_result_t ollama_parse_response(
     cc_llm_response_init(out_response);
 
     cc_json_value_t *root = NULL;
-    cc_result_t rc = cc_json_parse(response_json, &root);
-    if (rc.code != CC_OK || !root) {
-        if (root) cc_json_destroy(root);
-        return cc_result_error(CC_ERR_MODEL, "Failed to parse Ollama response");
-    }
+    cc_result_t rc = parse_protocol_json(response_json, &root);
+    if (rc.code != CC_OK) return rc;
+    if (!cc_json_is_object(root)) goto invalid;
 
     cc_json_value_t *api_error = cc_json_object_get(root, "error");
-    if (api_error) {
+    if (api_error && !cc_json_is_null(api_error)) {
         const char *msg = cc_json_string_value(api_error);
         cc_result_t err = cc_result_error(CC_ERR_MODEL, msg ? msg : "Unknown Ollama API error");
         cc_json_destroy(root);
@@ -290,45 +347,77 @@ static cc_result_t ollama_parse_response(
     }
 
     cc_json_value_t *message = cc_json_object_get(root, "message");
+    if (message && !cc_json_is_object(message)) goto invalid;
     if (message) {
-        const char *content = cc_json_string_value(cc_json_object_get(message, "content"));
-        if (content && strlen(content) > 0) {
-            cc_llm_response_set_text(out_response, content);
+        cc_json_value_t *content_value = cc_json_object_get(message, "content");
+        const char *content = cc_json_string_value(content_value);
+        if (content_value && !cc_json_is_null(content_value) && !content) goto invalid;
+        if (content && *content) {
+            rc = cc_llm_response_set_text(out_response, content);
+            if (rc.code != CC_OK) goto error;
         }
 
-        const char *reasoning = cc_json_string_value(cc_json_object_get(message, "reasoning_content"));
-        if (reasoning) out_response->reasoning_content = cc_copy_string(reasoning);
+        cc_json_value_t *reasoning_value = cc_json_object_get(message, "reasoning_content");
+        const char *reasoning = cc_json_string_value(reasoning_value);
+        if (reasoning_value && !cc_json_is_null(reasoning_value) && !reasoning) goto invalid;
+        if (reasoning) {
+            out_response->reasoning_content = cc_copy_string(reasoning);
+            if (!out_response->reasoning_content) goto oom;
+        }
 
         cc_json_value_t *tool_calls = cc_json_object_get(message, "tool_calls");
+        if (tool_calls && !cc_json_is_null(tool_calls) && !cc_json_is_array(tool_calls)) goto invalid;
         if (tool_calls && cc_json_is_array(tool_calls) && cc_json_array_size(tool_calls) > 0) {
             int n = cc_json_array_size(tool_calls);
             for (int i = 0; i < n; i++) {
                 cc_json_value_t *tc = cc_json_array_get(tool_calls, i);
                 cc_json_value_t *func = cc_json_object_get(tc, "function");
+                if (!cc_json_is_object(tc) || !cc_json_is_object(func)) goto invalid;
+                cc_json_value_t *id_value = cc_json_object_get(tc, "id");
+                const char *id = cc_json_string_value(id_value);
+                const char *name = cc_json_string_value(cc_json_object_get(func, "name"));
+                if ((id_value && !cc_json_is_null(id_value) && !id) || !name || !*name) goto invalid;
                 cc_json_value_t *args = cc_json_object_get(func, "arguments");
                 const char *args_text = cc_json_string_value(args);
                 char *args_owned = NULL;
-                if (!args_text && args) args_owned = cc_json_stringify_unformatted(args);
-                cc_llm_response_add_tool_call(
-                    out_response,
-                    cc_json_string_value(cc_json_object_get(tc, "id")),
-                    cc_json_string_value(cc_json_object_get(func, "name")),
+                if (!args_text && args && !cc_json_is_null(args)) {
+                    if (!cc_json_is_object(args)) goto invalid;
+                    args_owned = cc_json_stringify_unformatted(args);
+                    if (!args_owned) goto oom;
+                }
+                rc = cc_llm_response_add_tool_call(out_response, id, name,
                     args_text ? args_text : (args_owned ? args_owned : "{}"));
                 free(args_owned);
+                if (rc.code != CC_OK) goto error;
+                cc_result_free(&rc);
             }
         }
     }
 
-    out_response->finished = cc_json_bool_value(cc_json_object_get(root, "done"));
+    cc_json_value_t *done = cc_json_object_get(root, "done");
+    if (done && !cc_json_is_bool(done)) goto invalid;
+    out_response->finished = cc_json_bool_value(done);
     cc_json_destroy(root);
     return cc_result_ok();
+invalid:
+    rc = cc_result_error(CC_ERR_JSON, "Ollama response fields are invalid");
+    goto error;
+oom:
+    rc = cc_result_error(CC_ERR_OUT_OF_MEMORY, "Cannot copy Ollama response");
+error:
+    cc_json_destroy(root);
+    cc_llm_response_free(out_response);
+    return rc;
 }
 
-/*
- * 解析 Ollama NDJSON stream event。
- *
- * 每行 JSON 可能包含 content、reasoning_content、tool_calls 或 done；工具调用会立即输出
- * TOOL_START/TOOL_DELTA/TOOL_END，done=true 时通知通用 stream 层发送 FINISHED。
+/**
+ * @brief 解析一条 NDJSON 事件并同步交付推理、文本与完整工具调用块。
+ * @param[in] self 无状态协议，未使用，可为 NULL。
+ * @param[in] event_json 有效事件文本借用。
+ * @param[in] on_chunk 有效同步回调，块及其字段只借用到回调返回。
+ * @param[in,out] user_data 可选回调上下文借用。
+ * @param[out] out_finished 必填，参数通过后清零，done=true 时置一。
+ * @return 参数、JSON、模型或回调结果，失败前可已交付部分块，树和临时参数文本在返回前清理。
  */
 static cc_result_t ollama_parse_stream_event(
     void *self,
@@ -345,7 +434,7 @@ static cc_result_t ollama_parse_stream_event(
     *out_finished = 0;
 
     cc_json_value_t *root = NULL;
-    cc_result_t rc = cc_json_parse(event_json, &root);
+    cc_result_t rc = parse_protocol_json(event_json, &root);
     if (rc.code != CC_OK || !root || !cc_json_is_object(root)) {
         if (root) cc_json_destroy(root);
         if (rc.code == CC_OK) {
@@ -357,8 +446,9 @@ static cc_result_t ollama_parse_stream_event(
     cc_json_value_t *api_error = cc_json_object_get(root, "error");
     if (api_error) {
         const char *msg = cc_json_string_value(api_error);
+        cc_result_t error = cc_result_error(CC_ERR_MODEL, msg ? msg : "Unknown Ollama API error");
         cc_json_destroy(root);
-        return cc_result_error(CC_ERR_MODEL, msg ? msg : "Unknown Ollama API error");
+        return error;
     }
 
     cc_json_value_t *message = cc_json_object_get(root, "message");
@@ -393,6 +483,7 @@ static cc_result_t ollama_parse_stream_event(
                 cc_json_destroy(root);
                 return rc;
             }
+            cc_result_free(&rc);
         }
 
         cc_json_value_t *content_value = cc_json_object_get(message, "content");
@@ -412,6 +503,7 @@ static cc_result_t ollama_parse_stream_event(
                 cc_json_destroy(root);
                 return rc;
             }
+            cc_result_free(&rc);
         }
 
         cc_json_value_t *tool_calls = cc_json_object_get(message, "tool_calls");
@@ -456,12 +548,23 @@ static cc_result_t ollama_parse_stream_event(
                         cc_json_destroy(root);
                         return rc;
                     }
+                    cc_result_free(&rc);
                 }
 
                 cc_json_value_t *args = cc_json_object_get(func, "arguments");
                 const char *args_text = cc_json_string_value(args);
                 char *args_json = NULL;
-                if (!args_text && args) args_json = cc_json_stringify_unformatted(args);
+                if (!args_text && args && !cc_json_is_null(args)) {
+                    if (!cc_json_is_object(args)) {
+                        cc_json_destroy(root);
+                        return cc_result_error(CC_ERR_JSON, "Ollama tool arguments are not an object or string");
+                    }
+                    args_json = cc_json_stringify_unformatted(args);
+                    if (!args_json) {
+                        cc_json_destroy(root);
+                        return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Cannot serialize Ollama tool arguments");
+                    }
+                }
                 const char *payload = args_text ? args_text : args_json;
                 if (payload && *payload) {
                     cc_stream_chunk_t chunk = {
@@ -476,6 +579,7 @@ static cc_result_t ollama_parse_stream_event(
                         cc_json_destroy(root);
                         return rc;
                     }
+                    cc_result_free(&rc);
                 }
                 free(args_json);
             }
@@ -488,6 +592,7 @@ static cc_result_t ollama_parse_stream_event(
                 cc_json_destroy(root);
                 return rc;
             }
+            cc_result_free(&rc);
         }
     }
 
@@ -508,11 +613,13 @@ static cc_llm_protocol_vtable_t ollama_protocol_vtable = {
     NULL
 };
 
-/*
- * 创建 Ollama provider。
- *
- * 将 Ollama protocol 注入通用 HTTP provider；默认 base_url 指向本机 11434，默认模型可
- * 通过配置覆盖。
+/**
+ * @brief 注入静态 Ollama 协议并创建通用 provider。
+ * @param[in,out] http_client 有效 HTTP 借用，覆盖全部请求、回调与 provider 销毁。
+ * @param[in] base_url 调用期可选地址借用，NULL 使用 http://localhost:11434。
+ * @param[in] model 调用期可选模型借用，NULL 使用 qwen2.5-coder:7b。
+ * @param[out] out_provider 必填空资源槽，成功交付拥有 provider，失败保持原值。
+ * @return 通用构造结果，外层清理拥有诊断并在关闭排空后销毁 provider，HTTP 留归外层。
  */
 cc_result_t cc_ollama_provider_create(
     cc_http_client_t *http_client,

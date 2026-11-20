@@ -30,40 +30,40 @@
 extern "C" {
 #endif
 
-/* the error codes for the URL API */
+/* URL API 的稳定错误码，枚举值沿上游 ABI 保留。 */
 typedef enum {
   CURLUE_OK,
-  CURLUE_BAD_HANDLE,          /* 1 */
-  CURLUE_BAD_PARTPOINTER,     /* 2 */
-  CURLUE_MALFORMED_INPUT,     /* 3 */
-  CURLUE_BAD_PORT_NUMBER,     /* 4 */
-  CURLUE_UNSUPPORTED_SCHEME,  /* 5 */
-  CURLUE_URLDECODE,           /* 6 */
-  CURLUE_OUT_OF_MEMORY,       /* 7 */
-  CURLUE_USER_NOT_ALLOWED,    /* 8 */
-  CURLUE_UNKNOWN_PART,        /* 9 */
-  CURLUE_NO_SCHEME,           /* 10 */
-  CURLUE_NO_USER,             /* 11 */
-  CURLUE_NO_PASSWORD,         /* 12 */
-  CURLUE_NO_OPTIONS,          /* 13 */
-  CURLUE_NO_HOST,             /* 14 */
-  CURLUE_NO_PORT,             /* 15 */
-  CURLUE_NO_QUERY,            /* 16 */
-  CURLUE_NO_FRAGMENT,         /* 17 */
-  CURLUE_NO_ZONEID,           /* 18 */
-  CURLUE_BAD_FILE_URL,        /* 19 */
-  CURLUE_BAD_FRAGMENT,        /* 20 */
-  CURLUE_BAD_HOSTNAME,        /* 21 */
-  CURLUE_BAD_IPV6,            /* 22 */
-  CURLUE_BAD_LOGIN,           /* 23 */
-  CURLUE_BAD_PASSWORD,        /* 24 */
-  CURLUE_BAD_PATH,            /* 25 */
-  CURLUE_BAD_QUERY,           /* 26 */
-  CURLUE_BAD_SCHEME,          /* 27 */
-  CURLUE_BAD_SLASHES,         /* 28 */
-  CURLUE_BAD_USER,            /* 29 */
-  CURLUE_LACKS_IDN,           /* 30 */
-  CURLUE_TOO_LARGE,           /* 31 */
+  CURLUE_BAD_HANDLE,          /* 1，URL句柄无效。 */
+  CURLUE_BAD_PARTPOINTER,     /* 2，部件输出指针无效。 */
+  CURLUE_MALFORMED_INPUT,     /* 3，输入URL格式无效。 */
+  CURLUE_BAD_PORT_NUMBER,     /* 4，端口值无效。 */
+  CURLUE_UNSUPPORTED_SCHEME,  /* 5，协议方案缺少支持。 */
+  CURLUE_URLDECODE,           /* 6，URL解码失败。 */
+  CURLUE_OUT_OF_MEMORY,       /* 7，分配失败。 */
+  CURLUE_USER_NOT_ALLOWED,    /* 8，当前策略拒绝用户信息。 */
+  CURLUE_UNKNOWN_PART,        /* 9，未知部件类型。 */
+  CURLUE_NO_SCHEME,           /* 10，缺少协议方案。 */
+  CURLUE_NO_USER,             /* 11，缺少用户名。 */
+  CURLUE_NO_PASSWORD,         /* 12，缺少口令。 */
+  CURLUE_NO_OPTIONS,          /* 13，缺少登录选项。 */
+  CURLUE_NO_HOST,             /* 14，缺少主机。 */
+  CURLUE_NO_PORT,             /* 15，缺少端口。 */
+  CURLUE_NO_QUERY,            /* 16，缺少查询。 */
+  CURLUE_NO_FRAGMENT,         /* 17，缺少片段。 */
+  CURLUE_NO_ZONEID,           /* 18，缺少IPv6区域标识。 */
+  CURLUE_BAD_FILE_URL,        /* 19，file URL无效。 */
+  CURLUE_BAD_FRAGMENT,        /* 20，片段格式无效。 */
+  CURLUE_BAD_HOSTNAME,        /* 21，主机名无效。 */
+  CURLUE_BAD_IPV6,            /* 22，IPv6地址无效。 */
+  CURLUE_BAD_LOGIN,           /* 23，登录信息无效。 */
+  CURLUE_BAD_PASSWORD,        /* 24，口令格式无效。 */
+  CURLUE_BAD_PATH,            /* 25，路径格式无效。 */
+  CURLUE_BAD_QUERY,           /* 26，查询格式无效。 */
+  CURLUE_BAD_SCHEME,          /* 27，协议方案格式无效。 */
+  CURLUE_BAD_SLASHES,         /* 28，斜杠形式无效。 */
+  CURLUE_BAD_USER,            /* 29，用户名格式无效。 */
+  CURLUE_LACKS_IDN,           /* 30，缺少所需IDN能力。 */
+  CURLUE_TOO_LARGE,           /* 31，输入超过库限制。 */
   CURLUE_LAST
 } CURLUcode;
 
@@ -78,78 +78,84 @@ typedef enum {
   CURLUPART_PATH,
   CURLUPART_QUERY,
   CURLUPART_FRAGMENT,
-  CURLUPART_ZONEID /* added in 7.65.0 */
+  CURLUPART_ZONEID /* 自7.65.0提供的IPv6区域标识。 */
 } CURLUPart;
 
-#define CURLU_DEFAULT_PORT (1 << 0)       /* return default port number */
-#define CURLU_NO_DEFAULT_PORT (1 << 1)    /* act as if no port number was set,
-                                             if the port number matches the
-                                             default for the scheme */
-#define CURLU_DEFAULT_SCHEME (1 << 2)     /* return default scheme if
-                                             missing */
-#define CURLU_NON_SUPPORT_SCHEME (1 << 3) /* allow non-supported scheme */
-#define CURLU_PATH_AS_IS (1 << 4)         /* leave dot sequences */
-#define CURLU_DISALLOW_USER (1 << 5)      /* no user+password allowed */
-#define CURLU_URLDECODE (1 << 6)          /* URL decode on get */
-#define CURLU_URLENCODE (1 << 7)          /* URL encode on set */
-#define CURLU_APPENDQUERY (1 << 8)        /* append a form style part */
-#define CURLU_GUESS_SCHEME (1 << 9)       /* legacy curl-style guessing */
-#define CURLU_NO_AUTHORITY (1 << 10)      /* Allow empty authority when the
-                                             scheme is unknown. */
-#define CURLU_ALLOW_SPACE (1 << 11)       /* Allow spaces in the URL */
-#define CURLU_PUNYCODE (1 << 12)          /* get the hostname in punycode */
-#define CURLU_PUNY2IDN (1 << 13)          /* punycode => IDN conversion */
-#define CURLU_GET_EMPTY (1 << 14)         /* allow empty queries and fragments
-                                             when extracting the URL or the
-                                             components */
-#define CURLU_NO_GUESS_SCHEME (1 << 15)   /* for get, do not accept a guess */
+#define CURLU_DEFAULT_PORT (1 << 0)       /* 查询时可返回协议默认端口。 */
+#define CURLU_NO_DEFAULT_PORT (1 << 1)    /* 等于协议默认值的端口按省略处理。 */
+#define CURLU_DEFAULT_SCHEME (1 << 2)     /* 缺少方案时采用库的默认方案。 */
+#define CURLU_NON_SUPPORT_SCHEME (1 << 3) /* 解析时接受库未实现传输的方案。 */
+#define CURLU_PATH_AS_IS (1 << 4)         /* 保留路径点段。 */
+#define CURLU_DISALLOW_USER (1 << 5)      /* 拒绝用户名与口令部分。 */
+#define CURLU_URLDECODE (1 << 6)          /* 提取时执行URL解码。 */
+#define CURLU_URLENCODE (1 << 7)          /* 设置时执行URL编码。 */
+#define CURLU_APPENDQUERY (1 << 8)        /* 追加表单形式查询片段。 */
+#define CURLU_GUESS_SCHEME (1 << 9)       /* 沿历史curl规则推测方案。 */
+#define CURLU_NO_AUTHORITY (1 << 10)      /* 未知方案允许空authority。 */
+#define CURLU_ALLOW_SPACE (1 << 11)       /* 接受URL中的空格。 */
+#define CURLU_PUNYCODE (1 << 12)          /* 以Punycode形式提取主机名。 */
+#define CURLU_PUNY2IDN (1 << 13)          /* 将Punycode转换为国际化域名。 */
+#define CURLU_GET_EMPTY (1 << 14)         /* 提取时保留空查询与空片段。 */
+#define CURLU_NO_GUESS_SCHEME (1 << 15)   /* 查询时要求显式方案。 */
 
 typedef struct Curl_URL CURLU;
 
-/*
- * curl_url() creates a new CURLU handle and returns a pointer to it.
- * Must be freed with curl_url_cleanup().
+/**
+ * @brief 创建一个独立拥有的 URL 解析与构造句柄。
+ * @return 成功为新 CURLU 指针，分配失败为 NULL，最终 curl_url_cleanup。
+ * @note 同一句柄上的读写及销毁由拥有者串行化，独立句柄可以分别使用。
  */
 CURL_EXTERN CURLU *curl_url(void);
 
-/*
- * curl_url_cleanup() frees the CURLU handle and related resources used for
- * the URL parsing. It does not free strings previously returned with the URL
- * API.
+/**
+ * @brief 释放 URL 句柄及它内部拥有的解析部件。
+ * @param[in] u 待消费的拥有句柄，NULL 可用，拥有者先结束全部在途访问。
+ * @return 无返回值。
+ * @note get 已转移给调用者的字符串由调用者另外 curl_free。
  */
 CURL_EXTERN void curl_url_cleanup(CURLU *u);
 
-/*
- * curl_url_dup() duplicates a CURLU handle and returns a new copy. The new
- * handle must also be freed with curl_url_cleanup().
+/**
+ * @brief 复制 URL 句柄与已存部件，建立独立拥有的副本。
+ * @param[in] in 调用期间稳定且与修改/销毁串行的源句柄借用。
+ * @return 成功为独立句柄，失败为 NULL，新旧对象分别 curl_url_cleanup。
  */
 CURL_EXTERN CURLU *curl_url_dup(const CURLU *in);
 
-/*
- * curl_url_get() extracts a specific part of the URL from a CURLU
- * handle. Returns error code. The returned pointer MUST be freed with
- * curl_free() afterwards.
+/**
+ * @brief 提取完整 URL 或指定部件，并分配独立文本副本。
+ * @param[in] u 调用期间稳定的 URL 句柄借用。
+ * @param[in] what 完整 URL 或待提取部件类型。
+ * @param[out] part 必需的新字符串槽，成功转移拥有指针，由接收者 curl_free。
+ * @param[in] flags 该查询支持的默认端口、解码等位选项。
+ * @return CURLUE_OK 或部件缺失、参数、编码/IDN、分配错误，成功后使用输出。
+ * @note 输出寿命独立于 u，同一句柄的调用仍须与修改和销毁协调。
  */
 CURL_EXTERN CURLUcode curl_url_get(const CURLU *u, CURLUPart what,
                                    char **part, unsigned int flags);
 
-/*
- * curl_url_set() sets a specific part of the URL in a CURLU handle. Returns
- * error code. The passed in string is copied. Passing a NULL instead of
- * a part string, clears that part.
+/**
+ * @brief 设置完整 URL 或一个部件，输入文本在调用内复制。
+ * @param[in,out] u 调用者独占当前操作期的 URL 句柄借用。
+ * @param[in] what 完整 URL 或要修改的部件。
+ * @param[in] part NUL 结尾输入借用，NULL 清除指定部件。
+ * @param[in] flags 编码、路径点段、追加查询及方案策略等支持位。
+ * @return CURLUE_OK 或格式、策略、能力、容量、分配错误。
+ * @note 具体部件和flags共同决定解析规则，拥有者协调同一句柄的访问。
  */
 CURL_EXTERN CURLUcode curl_url_set(CURLU *u, CURLUPart what,
                                    const char *part, unsigned int flags);
 
-/*
- * curl_url_strerror() turns a CURLUcode value into the equivalent human
- * readable error string. This is useful for printing meaningful error
- * messages.
+/**
+ * @brief 把 URL API 结果码映射为诊断说明。
+ * @param[in] error 要说明的 CURLUcode。
+ * @return 库拥有的只读 NUL 结尾诊断借用，调用者保持内容原样。
+ * @note 返回指针不转移所有权，未知结果按链接库提供的缺省说明解释。
  */
 CURL_EXTERN const char *curl_url_strerror(CURLUcode error);
 
 #ifdef __cplusplus
-} /* end of extern "C" */
+} /* 结束 C 链接声明。 */
 #endif
 
-#endif /* CURLINC_URLAPI_H */
+#endif /* 结束 CURLINC_URLAPI_H 包含保护。 */

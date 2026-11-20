@@ -7,12 +7,14 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * 创建堆上 session 元数据对象。
- *
- * session 是 runtime、session store 和工具安全策略之间共享的身份边界。函数会深拷贝
- * 外部字符串，并在任一字段复制失败时销毁半成品，保证调用方只处理“成功完整对象”
- * 或“失败无对象”两种状态。
+/**
+ * @brief 深拷贝三个可选字段，创建初始状态为 ACTIVE 的会话元数据。
+ * @param[in] id 调用期间借用的可选 NUL 结尾标识，NULL 字段保留为空。
+ * @param[in] name 调用期间借用的可选会话名称。
+ * @param[in] workspace_dir 调用期间借用的可选工作目录。
+ * @param[out] out_session 必填空资源槽，成功接管堆对象，调用者 destroy，失败为 NULL。
+ * @return 成功为 CC_OK，空输出或分配失败为相应拥有结果，调用者释放诊断。
+ * @note 每个字符串独立复制，源字段在调用期间保持稳定，失败清理全部部分对象。
  */
 cc_result_t cc_session_create(
     const char *id,
@@ -43,14 +45,13 @@ cc_result_t cc_session_create(
     return cc_result_ok();
 }
 
-/*
- * 销毁 session。
- *
- * 这里释放的是 session 元数据本身，不负责释放该 session 下的 message 或 memory。
- * 那些集合由 session store / memory store 各自管理，避免一个 destroy 函数跨越太多
- * 存储边界。
+/**
+ * @brief 释放会话元数据拥有的全部字符串并清零结构。
+ * @param[in,out] session 独占、已初始化的会话对象，可为 NULL。
+ * @post 字段资源释放且结构清零，容器内存仍归调用者，空对象允许重复清理。
+ * @note 调用前排空该元数据的全部借用，消息和记忆集合由对应存储拥有者管理。
  */
-void cc_session_destroy(cc_session_t *session)
+void cc_session_cleanup(cc_session_t *session)
 {
     if (!session) return;
     free(session->id);
@@ -59,5 +60,32 @@ void cc_session_destroy(cc_session_t *session)
     free(session->model);
     free(session->created_at);
     free(session->updated_at);
+    memset(session, 0, sizeof(*session));
+}
+
+/**
+ * @brief 消费堆上会话数组，逐项清理字段后释放数组。
+ * @param[in,out] sessions 独占且兼容 free 的连续数组，NULL 时跳过。
+ * @param[in] count 已初始化元素数量，调用者保证实际容量覆盖。
+ * @post 全部字段和容器均释放，原数组及字段借用失效。
+ * @note 调用者先排空数组及元素的使用者，元素中的各字符串分别拥有。
+ */
+void cc_session_free_array(cc_session_t *sessions, size_t count)
+{
+    if (!sessions) return;
+    for (size_t i = 0; i < count; i++) cc_session_cleanup(&sessions[i]);
+    free(sessions);
+}
+
+/**
+ * @brief 消费单个堆会话，清理字段后释放结构。
+ * @param[in,out] session 兼容 free 的独占会话对象，可为 NULL。
+ * @post 对象和字段均释放，旧句柄失效。
+ * @note 调用者先结束全部借用，栈对象或数组元素使用 cleanup 清理。
+ */
+void cc_session_destroy(cc_session_t *session)
+{
+    if (!session) return;
+    cc_session_cleanup(session);
     free(session);
 }

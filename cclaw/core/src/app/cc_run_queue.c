@@ -16,18 +16,16 @@
 #define CC_RUN_QUEUE_LANE_COUNT 4
 #define CC_RUN_QUEUE_MAX_ACTIVE_SESSIONS 128
 
-/* run job 状态机：等待、运行、完成。collect 只会取走 COMPLETED job。 */
+/** @brief 作业在队列锁内从等待转为运行或完成，collect 只消费已完成项。 */
 typedef enum cc_run_job_state {
     CC_RUN_JOB_PENDING = 0,
     CC_RUN_JOB_RUNNING = 1,
     CC_RUN_JOB_COMPLETED = 2
 } cc_run_job_state_t;
 
-/*
- * 单个 session 的并发状态。
- *
- * key 是 agent/session 组合键；in_flight 记录该 session 正在运行的任务数；generation
- * 预留给中断/热切换时识别旧任务。
+/**
+ * @brief 队列拥有的会话键及在途计数，由队列 mutex 保护。
+ * generation 在会话中断时递增，当前调度与结果收集没有使用它作代际验证。
  */
 typedef struct cc_run_queue_session_state {
     char *key;
@@ -36,11 +34,10 @@ typedef struct cc_run_queue_session_state {
     unsigned long generation;
 } cc_run_queue_session_state_t;
 
-/*
- * 队列中的一个 run job。
- *
- * task 与 task_with_token 二选一；cancel_source 由 job 拥有；result 在 worker 完成后
- * 由 collect 转移给调用方。
+/**
+ * @brief 队列链表拥有的作业、取消源和结果，worker 在运行阶段借用。
+ * 普通任务的适配包装可由 owns_user_data 标记交给作业，包装内业务上下文继续借用。
+ * result 在 worker 返回并发布完成后交给唯一 collector，或由放弃/过期/销毁清理。
  */
 typedef struct cc_run_queue_job {
     cc_run_id_t id;
@@ -59,11 +56,10 @@ typedef struct cc_run_queue_job {
     struct cc_run_queue_job *next;
 } cc_run_queue_job_t;
 
-/*
- * run queue 内部状态。
- *
- * jobs 是待处理/运行/已完成 job 链表；lane_in_flight 和 sessions 共同限制全局 lane 并发
- * 与同 session 并发。mutex/cond 保护所有共享状态。
+/**
+ * @brief 队列拥有作业链、活动会话表、worker 及同步资源。
+ * mutex 保护作业发布、状态及统计，cond 供 worker、collector 和 shutdown 重新检查谓词。
+ * worker 在锁外执行任务并填写尚未发布的结果，回锁后发布完成供其他调用读取。
  */
 struct cc_run_queue {
     cc_run_queue_config_t config;
@@ -89,13 +85,22 @@ struct cc_run_queue {
     cc_cond_t cond;
 };
 
-/* 构造取消结果，统一 CC_ERR_CANCELLED 的消息。 */
+/**
+ * @brief 创建带指定说明的取消结果。
+ * @param[in] message 借用的说明文本，NULL 时采用默认说明。
+ * @return 拥有的 CC_ERR_CANCELLED 结果，接收者用 cc_result_free 清理消息。
+ */
 static cc_result_t cancelled_result(const char *message)
 {
     return cc_result_error(CC_ERR_CANCELLED, message ? message : "Run cancelled");
 }
 
-/* 释放 job 及其拥有的 session_key、result、cancel_source 和可选 user_data。 */
+/**
+ * @brief 清理已经摘除或尚未发布的作业及其拥有资源。
+ * @pre 作业已无 worker、collector 和取消 token 借用，或尚未交给队列。
+ * @param[in] job 消费拥有的作业，允许 NULL，普通包装内的业务上下文保持借用。
+ * @post 作业、键、结果、取消源及被标记拥有的适配包装均已释放。
+ */
 static void free_job(cc_run_queue_job_t *job)
 {
     if (!job) return;
@@ -108,7 +113,10 @@ static void free_job(cc_run_queue_job_t *job)
     free(job);
 }
 
-/* 返回默认队列配置。 */
+/**
+ * @brief 返回四类 lane 与会话各并发一、总任务最多 256 项的默认配置。
+ * @return 按值配置，同会话最多等待两项，完成结果默认保留 300000 毫秒。
+ */
 cc_run_queue_config_t cc_run_queue_default_config(void)
 {
     cc_run_queue_config_t config;
@@ -123,13 +131,21 @@ cc_run_queue_config_t cc_run_queue_default_config(void)
     return config;
 }
 
-/* 将非法并发值归一化为 1，防止配置导致 lane 永远不可运行。 */
+/**
+ * @brief 将非正并发值归一为一，保留正值。
+ * @param[in] value 配置中的整数并发值。
+ * @return 至少为一的并发上限。
+ */
 static int normalized_limit(int value)
 {
     return value <= 0 ? 1 : value;
 }
 
-/* lane enum 到数组索引的映射。 */
+/**
+ * @brief 将四种 lane 映射到内部数组下标。
+ * @param[in] lane 待检查的 lane 值。
+ * @return 有效值返回零到三，其他值返回负一。
+ */
 static int lane_index(cc_run_queue_lane_t lane)
 {
     switch (lane) {
@@ -141,7 +157,12 @@ static int lane_index(cc_run_queue_lane_t lane)
     }
 }
 
-/* 获取指定 lane 的并发上限。 */
+/**
+ * @brief 从不可变配置读取并归一化某个 lane 的并发上限。
+ * @param[in] queue 借用的存活队列。
+ * @param[in] lane 内部 lane 下标，零到三选择对应配置。
+ * @return 正数上限，未知下标返回一。
+ */
 static int lane_limit(const cc_run_queue_t *queue, int lane)
 {
     switch (lane) {
@@ -153,16 +174,20 @@ static int lane_limit(const cc_run_queue_t *queue, int lane)
     }
 }
 
-/* 获取同 session 并发上限。 */
+/**
+ * @brief 读取并归一化同会话在途任务上限。
+ * @param[in] queue 借用的存活队列。
+ * @return 至少为一的会话并发上限。
+ */
 static int session_limit(const cc_run_queue_t *queue)
 {
     return normalized_limit(queue->config.per_session_concurrency);
 }
 
-/*
- * 根据 lane 并发推导 worker 数。
- *
- * worker 总数不会无限增长，最大限制为 32，避免桌面配置误填导致线程爆炸。
+/**
+ * @brief 用宽整数合计归一化并发，得到最多 32 个共享 worker。
+ * @param[in] config 借用的有效配置，四个 int 上限先转换为 uint64_t 再相加。
+ * @return 四到 32 之间的 worker 数，各 lane 共享这些 worker。
  */
 static size_t desired_worker_count(const cc_run_queue_config_t *config)
 {
@@ -170,15 +195,18 @@ static size_t desired_worker_count(const cc_run_queue_config_t *config)
     int subagent_limit = normalized_limit(config->subagent_concurrency);
     int plugin_limit = normalized_limit(config->plugin_concurrency);
     int mcp_limit = normalized_limit(config->mcp_concurrency);
-    int total = main_limit + subagent_limit + plugin_limit + mcp_limit;
-    if (total < 1) total = 1;
-
-
-    if (total > 32) total = 32;
-    return (size_t)total;
+    uint64_t total = (uint64_t)main_limit + (uint64_t)subagent_limit +
+        (uint64_t)plugin_limit + (uint64_t)mcp_limit;
+    return total > 32U ? 32U : (size_t)total;
 }
 
-/* 在持锁状态下查找 session 状态。 */
+/**
+ * @brief 按字节查找已登记的会话状态。
+ * @pre 调用者持有队列 mutex。
+ * @param[in] queue 借用的队列。
+ * @param[in] session_key 有效的借用会话键。
+ * @return 匹配项下标，缺失返回负一，借用仅在保持锁时有效。
+ */
 static int find_session_locked(const cc_run_queue_t *queue, const char *session_key)
 {
     for (size_t i = 0; i < queue->session_count; i++) {
@@ -189,7 +217,13 @@ static int find_session_locked(const cc_run_queue_t *queue, const char *session_
     return -1;
 }
 
-/* 在持锁状态下创建 session 状态；达到固定上限时失败。 */
+/**
+ * @brief 为即将运行的首个会话作业复制键并登记零在途状态。
+ * @pre 调用者持有队列 mutex，已确认键不存在并准备立即增加在途计数。
+ * @param[in,out] queue 借用的队列，成功增加 session_count。
+ * @param[in] session_key 有效的借用会话键，成功后队列拥有独立副本。
+ * @return 新项下标，达到 128 项上限或分配失败返回负一且不增加条数。
+ */
 static int create_session_locked(cc_run_queue_t *queue, const char *session_key)
 {
     if (queue->session_count >= CC_RUN_QUEUE_MAX_ACTIVE_SESSIONS) return -1;
@@ -202,7 +236,13 @@ static int create_session_locked(cc_run_queue_t *queue, const char *session_key)
     return (int)(queue->session_count - 1);
 }
 
-/* 删除没有 in-flight 任务的 session 状态，保持 session 表紧凑。 */
+/**
+ * @brief 释放零在途会话的键，用末项填补空位并减少条数。
+ * @pre 调用者持有队列 mutex，后续按键重新查找会话，避免缓存被移动的下标。
+ * @param[in,out] queue 借用的队列。
+ * @param[in] index 待检查的下标，负数、越界或仍有在途作业时保持原状态。
+ * @post 可移除项已释放并从有效数组删除，其他项下标可能变化。
+ */
 static void remove_idle_session_locked(cc_run_queue_t *queue, int index)
 {
     if (index < 0 || (size_t)index >= queue->session_count) return;
@@ -216,7 +256,13 @@ static void remove_idle_session_locked(cc_run_queue_t *queue, int index)
     queue->session_count--;
 }
 
-/* 统计某个 session 的 pending job 数，用于 max_pending_per_session 背压。 */
+/**
+ * @brief 扫描链表统计指定会话的等待作业。
+ * @pre 调用者持有队列 mutex。
+ * @param[in] queue 借用的队列。
+ * @param[in] session_key 有效的借用会话键。
+ * @return 等待状态且键匹配的作业数，运行及已完成作业不计入。
+ */
 static size_t pending_count_for_session_locked(
     const cc_run_queue_t *queue,
     const char *session_key
@@ -233,10 +279,13 @@ static size_t pending_count_for_session_locked(
     return count;
 }
 
-/*
- * 把 pending job 标记为已取消完成。
- *
- * 这种 job 尚未被 worker 取走，因此可以直接写入取消 result 并减少 pending 计数。
+/**
+ * @brief 将尚未执行的等待作业转为取消完成并更新统计。
+ * @pre 调用者持有队列 mutex，并负责在本次状态更新后广播条件变量。
+ * @param[in,out] queue 借用的队列，减少等待数并增加完成及取消累计数。
+ * @param[in,out] job 队列拥有的作业，NULL 或非等待状态时保持原状。
+ * @param[in] message 借用的取消说明，由结果复制保存。
+ * @post 有效等待项拥有取消结果、完成时刻及已置位取消源，任务回调不会再执行。
  */
 static void complete_pending_job_locked(cc_run_queue_t *queue, cc_run_queue_job_t *job, const char *message)
 {
@@ -251,11 +300,12 @@ static void complete_pending_job_locked(cc_run_queue_t *queue, cc_run_queue_job_
     job->completed_at_ms = cc_platform_monotonic_ms();
 }
 
-/*
- * 应用提交 action 对旧任务的影响。
- *
- * STEER/INTERRUPT 会取消运行中任务，STEER/COLLECT/INTERRUPT 会取消 pending 任务；FOLLOWUP
- * 保留旧任务并排队。
+/**
+ * @brief 按新请求的 action 更新同会话旧任务的取消状态。
+ * @pre 调用者持有队列 mutex，在发布新作业后统一广播条件变量。
+ * @param[in,out] queue 借用的队列，NULL 时直接返回。
+ * @param[in] request 借用的请求，NULL 或会话键为空指针时直接返回。
+ * @post STEER/INTERRUPT 向运行项发取消，STEER/COLLECT/INTERRUPT 将等待项取消完成，其他值保留旧任务。
  */
 static void apply_submit_action_locked(
     cc_run_queue_t *queue,
@@ -279,7 +329,13 @@ static void apply_submit_action_locked(
     }
 }
 
-/* 在持锁状态下按 run_id 查找 job。 */
+/**
+ * @brief 按运行 ID 查找队列仍保留的作业。
+ * @pre 调用者持有队列 mutex。
+ * @param[in] queue 借用的队列。
+ * @param[in] run_id 待查运行 ID。
+ * @return 锁内借用的作业地址，缺失返回 NULL，解锁后需由状态及拥有协议保护。
+ */
 static cc_run_queue_job_t *find_job_locked(cc_run_queue_t *queue, cc_run_id_t run_id)
 {
     for (cc_run_queue_job_t *job = queue->jobs; job; job = job->next) {
@@ -288,7 +344,13 @@ static cc_run_queue_job_t *find_job_locked(cc_run_queue_t *queue, cc_run_id_t ru
     return NULL;
 }
 
-/* 在持锁状态下从链表摘除 job，所有权转移给调用方。 */
+/**
+ * @brief 按 ID 从链表摘除作业并调整总数及完成数。
+ * @pre 调用者持有队列 mutex，目标为可安全移交的完成项，等待或运行计数由外层负责。
+ * @param[in,out] queue 借用的队列。
+ * @param[in] run_id 待摘除的运行 ID。
+ * @return 拥有的孤立作业，由调用者 free_job，缺失返回 NULL。
+ */
 static cc_run_queue_job_t *take_job_locked(cc_run_queue_t *queue, cc_run_id_t run_id)
 {
     cc_run_queue_job_t *prev = NULL;
@@ -311,6 +373,12 @@ static cc_run_queue_job_t *take_job_locked(cc_run_queue_t *queue, cc_run_id_t ru
     return NULL;
 }
 
+/**
+ * @brief 删除完成时间达到 TTL 的作业并清理其结果和包装。
+ * @pre 非空队列的 mutex 已由调用者持有，完成项的任务及 token 借用已结束。
+ * @param[in,out] queue 借用的队列，NULL 或 TTL 为零时直接返回。
+ * @post 过期完成项已删除，之后 collect 对这些 ID 返回未找到。
+ */
 static void purge_expired_completed_locked(cc_run_queue_t *queue)
 {
     if (!queue || queue->config.completed_ttl_ms == 0) return;
@@ -336,47 +404,56 @@ static void purge_expired_completed_locked(cc_run_queue_t *queue)
     }
 }
 
-/*
- * 查找当前可运行 job。
- *
- * 只有同时满足 lane 并发和 session 并发限制的 pending job 才会进入 RUNNING。无效 lane
- * 或无法创建 session 状态的 job 会直接转成取消完成。
+/**
+ * @brief 按链表顺序选取同时满足 lane 和会话预算的等待作业。
+ * @pre 调用者持有队列 mutex。
+ * @param[in,out] queue 借用的队列，先检查 lane 预算，再为即将运行的会话分配状态。
+ * @return 借给当前 worker 的运行作业，增加在途并减少等待计数，无可运行项返回 NULL。
+ * @note 无效 lane 或会话状态分配失败会取消完成该项，两条返回路径均广播这些完成变化。
  */
 static cc_run_queue_job_t *find_runnable_job_locked(cc_run_queue_t *queue)
 {
+    cc_run_queue_job_t *runnable = NULL;
+    int completed_pending = 0;
     for (cc_run_queue_job_t *job = queue->jobs; job; job = job->next) {
         if (job->state != CC_RUN_JOB_PENDING) continue;
         int lane = lane_index(job->lane);
         if (lane < 0) {
             complete_pending_job_locked(queue, job, "Invalid run queue lane");
+            completed_pending = 1;
             continue;
         }
+        if (queue->lane_in_flight[lane] >= lane_limit(queue, lane)) continue;
         int session_index = find_session_locked(queue, job->session_key);
         if (session_index < 0) {
             session_index = create_session_locked(queue, job->session_key);
             if (session_index < 0) {
                 complete_pending_job_locked(queue, job, "Failed to track session state");
+                completed_pending = 1;
                 continue;
             }
         }
         cc_run_queue_session_state_t *session = &queue->sessions[session_index];
-        if (session->in_flight < session_limit(queue) &&
-            queue->lane_in_flight[lane] < lane_limit(queue, lane)) {
+        if (session->in_flight < session_limit(queue)) {
             session->in_flight++;
             queue->lane_in_flight[lane]++;
             queue->total_in_flight++;
             if (queue->total_pending > 0) queue->total_pending--;
             job->state = CC_RUN_JOB_RUNNING;
-            return job;
+            runnable = job;
+            break;
         }
     }
-    return NULL;
+    if (completed_pending) cc_cond_broadcast(queue->cond);
+    return runnable;
 }
 
-/*
- * 完成运行中 job 的资源计数回收。
- *
- * 减少 lane/session/total in-flight，必要时移除 idle session，并把 job 标记 COMPLETED。
+/**
+ * @brief 在任务返回后回收 lane、会话及总在途计数并发布完成。
+ * @pre 调用者持有队列 mutex，job 为本 worker 独占执行且已经填妥结果的运行项。
+ * @param[in,out] queue 借用的队列。
+ * @param[in,out] job 队列拥有的运行作业。
+ * @post 作业为带完成时间的完成项，零在途会话移除，worker 继续处理取消计数及唤醒。
  */
 static void finish_running_job_locked(cc_run_queue_t *queue, cc_run_queue_job_t *job)
 {
@@ -398,11 +475,11 @@ static void finish_running_job_locked(cc_run_queue_t *queue, cc_run_queue_job_t 
     queue->completed_total++;
 }
 
-/*
- * worker 主循环。
- *
- * worker 在条件变量上等待 runnable job；取到 job 后释放锁执行用户任务，避免任务执行时
- * 阻塞提交/中断/collect。完成后重新加锁更新状态并唤醒等待者。
+/**
+ * @brief 在条件变量上等待可运行项，锁外执行任务并回锁发布结果。
+ * @param[in,out] arg 借用的队列地址，由创建者保持到所有 worker join 结束。
+ * @return 队列关闭后返回 NULL，线程资源由拥有者 join 回收。
+ * @note 回调借用上下文及 token，仅在本次调用内有效，放弃项在完成发布后摘除并清理。
  */
 static void *worker_main(void *arg)
 {
@@ -443,11 +520,12 @@ static void *worker_main(void *arg)
     }
 }
 
-/*
- * 创建 run queue。
- *
- * 初始化 mutex/cond/worker 数组并启动 worker。任一 worker 启动失败都会设置 shutdown、
- * join 已启动线程并释放所有资源。
+/**
+ * @brief 复制配置、创建同步资源并启动有上限的共享 worker 池。
+ * @param[in] config 调用期间借用的配置，NULL 使用默认值，队列保存按值副本。
+ * @param[out] out_queue 必填，成功写入拥有的队列，失败保留原槽值。
+ * @return 成功为 CC_OK，空输出为 CC_ERR_INVALID_ARGUMENT，分配和线程端口错误向上传递。
+ * @note 部分 worker 创建失败时先关闭并 join 已启动线程，再释放本次资源。
  */
 cc_result_t cc_run_queue_create(
     const cc_run_queue_config_t *config,
@@ -500,11 +578,12 @@ cc_result_t cc_run_queue_create(
     return cc_result_ok();
 }
 
-/*
- * 销毁 run queue。
- *
- * 先设置 shutting_down 并取消未完成 job，再 join worker，最后释放 job/session/同步原语。
- * 调用方应停止提交新任务后再销毁。
+/**
+ * @brief 关闭接纳、等待运行回调并 join 所有 worker，随后释放整个队列。
+ * @pre 拥有者已关闭外部入口并排空其他 API 调用，当前线程不是本队列 worker，业务上下文保持到任务退出。
+ * @param[in] queue 消费拥有的队列，允许 NULL。
+ * @post 队列、剩余结果、包装、会话键及同步资源已释放，销毁后所有借用句柄失效。
+ * @note 普通任务及不检查取消的回调可能使等待持续，UINT_MAX 在本接口表示无限等待。
  */
 void cc_run_queue_destroy(cc_run_queue_t *queue)
 {
@@ -534,18 +613,25 @@ void cc_run_queue_destroy(cc_run_queue_t *queue)
     free(queue);
 }
 
-/*
- * 提交带 cancel token 的任务。
- *
- * 创建 job 和 cancel source，在锁内检查 shutdown、pending 上限、应用 action，然后追加到
- * FIFO 链表并唤醒 worker。
+/**
+ * @brief 准备作业并在锁内验证容量、处理旧任务，再发布给 worker。
+ * @pre 调用期间 queue 仍存活，user_data 的借用期覆盖回调及已接纳作业的结束。
+ * @param[in,out] queue 借用的存活队列。
+ * @param[in] request 调用期间借用的请求，复制非空 session_key，lane 必须有效。
+ * @param[in] task 在 worker 上调用的非空函数。
+ * @param[in] user_data 回调上下文，owns_user_data 非零时只在成功发布后消费该指针。
+ * @param[out] out_run_id 必填，成功在发布锁内写入运行 ID，失败保留原值。
+ * @param[in] owns_user_data 成功后由作业负责 free 的适配包装标志，失败仍归调用者。
+ * @return 成功为 CC_OK，非法参数为 CC_ERR_INVALID_ARGUMENT，关闭为 CC_ERR_CANCELLED，容量为 CC_ERR_QUEUE_FULL，分配和 ID 错误向上传递。
+ * @note 背压检查先于 action。TTL 清理可能已发生，成功接纳时拥有标志先于作业可见性写入。
  */
-cc_result_t cc_run_queue_submit_with_token(
+static cc_result_t run_queue_submit_with_token_owned(
     cc_run_queue_t *queue,
     const cc_run_queue_request_t *request,
     cc_run_queue_task_with_token_fn task,
     void *user_data,
-    cc_run_id_t *out_run_id
+    cc_run_id_t *out_run_id,
+    int owns_user_data
 )
 {
     if (!queue || !request || !request->session_key || !task || !out_run_id) {
@@ -619,6 +705,8 @@ cc_result_t cc_run_queue_submit_with_token(
         return cc_result_error(CC_ERR_PLATFORM, "Failed to allocate a unique secure run ID");
     }
     apply_submit_action_locked(queue, request);
+    /* 先交接适配包装的拥有权，再把作业发布到 worker 可见链表。 */
+    job->owns_user_data = owns_user_data;
     if (!queue->jobs) {
         queue->jobs = queue->tail = job;
     } else {
@@ -640,13 +728,39 @@ cc_result_t cc_run_queue_submit_with_token(
     return cc_result_ok();
 }
 
-/* 普通 task 的包装结构，用于复用带 token 提交流程。 */
+/**
+ * @brief 借用业务上下文，提交可在回调内检查取消 token 的任务。
+ * @pre 拥有者保持队列及业务上下文覆盖本次 API 和已接纳任务的寿命。
+ * @param[in,out] queue 借用的队列。
+ * @param[in] request 调用期间借用的元数据，成功复制会话键。
+ * @param[in] task 非空 worker 回调，结果拥有权交给队列。
+ * @param[in] user_data 借用的业务上下文，允许 NULL，队列不释放。
+ * @param[out] out_run_id 必填，成功写运行 ID，失败保留原值。
+ * @return 统一提交路径的接纳、参数、背压、关闭或资源错误。
+ */
+cc_result_t cc_run_queue_submit_with_token(
+    cc_run_queue_t *queue,
+    const cc_run_queue_request_t *request,
+    cc_run_queue_task_with_token_fn task,
+    void *user_data,
+    cc_run_id_t *out_run_id)
+{
+    return run_queue_submit_with_token_owned(
+        queue, request, task, user_data, out_run_id, 0);
+}
+
+/** @brief 队列成功接纳后拥有的普通任务适配包装，业务 user_data 继续借用。 */
 typedef struct cc_run_queue_plain_task {
     cc_run_queue_task_fn task;
     void *user_data;
 } cc_run_queue_plain_task_t;
 
-/* 忽略 cancel token 执行普通 task。 */
+/**
+ * @brief 将带 token 的 worker 调用适配到普通任务回调。
+ * @param[in] user_data 借用的有效普通任务包装，由作业保持到回调退出。
+ * @param[in] cancel_token 调用期间借用的取消 token，本适配层不检查。
+ * @return 普通回调交付的拥有结果，由队列保存后交给 collector 或清理。
+ */
 static cc_result_t run_plain_task_with_token(void *user_data, cc_cancel_token_t *cancel_token)
 {
     (void)cancel_token;
@@ -654,11 +768,15 @@ static cc_result_t run_plain_task_with_token(void *user_data, cc_cancel_token_t 
     return plain->task(plain->user_data);
 }
 
-/*
- * 提交不接收 cancel token 的任务。
- *
- * 通过小 wrapper 适配到 submit_with_token；提交成功后 job owns_user_data=1，由 free_job
- * 释放 wrapper。
+/**
+ * @brief 创建适配包装并提交普通任务，成功后包装交给作业拥有。
+ * @pre 队列和业务上下文由外层保持到本次 API 及已接纳任务结束。
+ * @param[in,out] queue 借用的队列。
+ * @param[in] request 调用期间借用的请求，成功复制会话键。
+ * @param[in] task 非空普通回调，其执行中途由回调自身决定退出。
+ * @param[in] user_data 借用的业务上下文，允许 NULL，队列仅释放外层包装。
+ * @param[out] out_run_id 必填，成功写运行 ID，失败保留原值。
+ * @return 成功为 CC_OK，参数、包装分配及统一提交路径错误向上传递，失败归还本次包装。
  */
 cc_result_t cc_run_queue_submit(
     cc_run_queue_t *queue,
@@ -673,28 +791,24 @@ cc_result_t cc_run_queue_submit(
     if (!plain) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to allocate run queue task wrapper");
     plain->task = task;
     plain->user_data = user_data;
-    cc_result_t rc = cc_run_queue_submit_with_token(
+    cc_result_t rc = run_queue_submit_with_token_owned(
         queue,
         request,
         run_plain_task_with_token,
         plain,
-        out_run_id
+        out_run_id,
+        1
     );
     if (rc.code != CC_OK) free(plain);
-    else {
-        cc_mutex_lock(queue->mutex);
-        cc_run_queue_job_t *job = find_job_locked(queue, *out_run_id);
-        if (job) job->owns_user_data = 1;
-        cc_mutex_unlock(queue->mutex);
-    }
     return rc;
 }
 
-/*
- * 等待并收集 run 结果。
- *
- * collect 会阻塞到 job COMPLETED，然后从链表摘除 job，把 result 按值返回给调用方，并
- * 清空 job->result 避免 free_job 重复释放。
+/**
+ * @brief 无限等待指定作业完成并消费其结果。
+ * @pre 队列存活，同一结果由单个成功 collector 消费，回调不得等待依赖自身完成的作业。
+ * @param[in,out] queue 借用的队列。
+ * @param[in] run_id 非零运行 ID。
+ * @return 原任务交付的拥有结果，或参数/未找到错误，接收者统一用 cc_result_free 清理。
  */
 cc_result_t cc_run_queue_collect(
     cc_run_queue_t *queue,
@@ -704,6 +818,49 @@ cc_result_t cc_run_queue_collect(
     return cc_run_queue_collect_timeout(queue, run_id, UINT_MAX);
 }
 
+/**
+ * @brief 在持锁状态下等待指定作业完成，唤醒后重新定位作业。
+ * @pre 调用者持有队列 mutex，并保持队列存活，输出地址有效。
+ * @param[in,out] queue 借用的队列，条件等待期间暂时释放并重新取得同一锁。
+ * @param[in] run_id 待查运行 ID。
+ * @param[in] timeout_ms 等待预算，UINT_MAX 无限等待。
+ * @param[in] started 有限预算的调用起始毫秒，包含进入 mutex 前的耗时，无限等待时忽略。
+ * @param[out] out_job 写入锁内借用项，成功时为完成作业，失败时不能使用其值。
+ * @return 已完成为 CC_OK，超时或作业缺失返回对应错误，成功后仍由队列拥有结果。
+ */
+static cc_result_t wait_for_job_locked(cc_run_queue_t *queue, cc_run_id_t run_id,
+                                       unsigned timeout_ms, uint64_t started,
+                                       cc_run_queue_job_t **out_job)
+{
+    *out_job = find_job_locked(queue, run_id);
+    while (*out_job && (*out_job)->state != CC_RUN_JOB_COMPLETED) {
+        if (timeout_ms == UINT_MAX) {
+            cc_cond_wait(queue->cond, queue->mutex);
+        } else {
+            uint64_t elapsed = cc_platform_monotonic_ms() - started;
+            if (elapsed >= timeout_ms) {
+                return cc_result_error(CC_ERR_TIMEOUT, "Timed out waiting for run result");
+            }
+            unsigned remaining = timeout_ms - (unsigned)elapsed;
+            int slice = remaining > 50U ? 50 : (int)remaining;
+            if (slice <= 0) slice = 1;
+            (void)cc_cond_timedwait(queue->cond, queue->mutex, slice);
+        }
+        *out_job = find_job_locked(queue, run_id);
+    }
+    if (!*out_job) return cc_result_error(CC_ERR_NOT_FOUND, "Run id not found");
+    return cc_result_ok();
+}
+
+/**
+ * @brief 按调用起始预算等待完成，再摘除作业并转移结果拥有权。
+ * @pre 外层保持队列存活并排除销毁，同一 ID 的竞争收集者最多一个取得结果。
+ * @param[in,out] queue 借用的队列。
+ * @param[in] run_id 非零运行 ID，已放弃、清理或被其他 collector 消费时可能缺失。
+ * @param[in] timeout_ms 等待毫秒预算，UINT_MAX 无限等待，零值只接受当前已完成项。
+ * @return 原任务结果或 CC_ERR_INVALID_ARGUMENT/CC_ERR_TIMEOUT/CC_ERR_NOT_FOUND，超时保留作业供后续处理。
+ * @note 条件等待后重新按 ID 查找，归还的 cc_result_t 消息由调用者清理，锁取得耗时计入预算。
+ */
 cc_result_t cc_run_queue_collect_timeout(
     cc_run_queue_t *queue,
     cc_run_id_t run_id,
@@ -715,27 +872,13 @@ cc_result_t cc_run_queue_collect_timeout(
     }
     uint64_t started = cc_platform_monotonic_ms();
     cc_mutex_lock(queue->mutex);
-    cc_run_queue_job_t *job = find_job_locked(queue, run_id);
-    while (job && job->state != CC_RUN_JOB_COMPLETED) {
-        if (timeout_ms == UINT_MAX) {
-            cc_cond_wait(queue->cond, queue->mutex);
-        } else {
-            uint64_t elapsed = cc_platform_monotonic_ms() - started;
-            if (elapsed >= timeout_ms) {
-                cc_mutex_unlock(queue->mutex);
-                return cc_result_error(CC_ERR_TIMEOUT, "Timed out waiting for run result");
-            }
-            unsigned remaining = timeout_ms - (unsigned)elapsed;
-            int slice = remaining > 50U ? 50 : (int)remaining;
-            if (slice <= 0) slice = 1;
-            (void)cc_cond_timedwait(queue->cond, queue->mutex, slice);
-        }
-        job = find_job_locked(queue, run_id);
-    }
-    if (!job) {
+    cc_run_queue_job_t *job = NULL;
+    cc_result_t rc = wait_for_job_locked(queue, run_id, timeout_ms, started, &job);
+    if (rc.code != CC_OK) {
         cc_mutex_unlock(queue->mutex);
-        return cc_result_error(CC_ERR_NOT_FOUND, "Run id not found");
+        return rc;
     }
+    cc_result_free(&rc);
     job = take_job_locked(queue, run_id);
     cc_mutex_unlock(queue->mutex);
 
@@ -745,7 +888,35 @@ cc_result_t cc_run_queue_collect_timeout(
     return result;
 }
 
-/* 同步运行任务：submit 后立即 collect。 */
+/**
+ * @brief 无限等待作业完成，保留原结果和作业供之后 collect。
+ * @pre 外层保持队列存活，调用线程不依赖自身任务完成，成功前仍允许其他调用收集或清理作业。
+ * @param[in,out] queue 借用的队列。
+ * @param[in] run_id 非零运行 ID。
+ * @return 找到完成作业为 CC_OK，参数非法或 ID 已缺失返回对应错误，不返回任务自身的结果码。
+ * @note 缺失本身不证明外部动作状态，已知接纳 ID 的拥有者结合收集、放弃和 TTL 协议解释。
+ */
+cc_result_t cc_run_queue_wait(cc_run_queue_t *queue, cc_run_id_t run_id)
+{
+    if (!queue || run_id == 0) {
+        return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Invalid run queue wait request");
+    }
+    cc_mutex_lock(queue->mutex);
+    cc_run_queue_job_t *job = NULL;
+    cc_result_t rc = wait_for_job_locked(queue, run_id, UINT_MAX, 0, &job);
+    cc_mutex_unlock(queue->mutex);
+    return rc;
+}
+
+/**
+ * @brief 提交普通任务并立即无限等待收集其结果。
+ * @pre 队列及业务上下文覆盖本次同步调用，回调的依赖关系允许取得所需 worker 和会话预算。
+ * @param[in,out] queue 借用的队列。
+ * @param[in] request 调用期间借用的元数据。
+ * @param[in] task 非空普通回调。
+ * @param[in] user_data 借用的回调上下文，允许 NULL。
+ * @return 提交错误或拥有的任务结果，接收者用 cc_result_free 清理。
+ */
 cc_result_t cc_run_queue_run(
     cc_run_queue_t *queue,
     const cc_run_queue_request_t *request,
@@ -759,11 +930,12 @@ cc_result_t cc_run_queue_run(
     return cc_run_queue_collect(queue, run_id);
 }
 
-/*
- * 中断整个 session 的任务。
- *
- * pending job 转成取消完成，running job 触发 cancel_source；真正退出取决于任务是否检查
- * cancel token。
+/**
+ * @brief 取消指定会话的等待项，并向运行项发取消信号。
+ * @param[in,out] queue 借用且在整个调用期存活的队列。
+ * @param[in] session_key 非空指针的借用会话键，按字节匹配。
+ * @return 有效参数为 CC_OK，包括没有匹配项，空参数为 CC_ERR_INVALID_ARGUMENT。
+ * @note 等待项保留取消结果供收集，运行项退出取决于回调检查，成功返回不等待退出。
  */
 cc_result_t cc_run_queue_interrupt_session(
     cc_run_queue_t *queue,
@@ -789,7 +961,13 @@ cc_result_t cc_run_queue_interrupt_session(
     return cc_result_ok();
 }
 
-/* 中断指定 run_id 的任务。 */
+/**
+ * @brief 定位作业并取消等待项或向运行项发布取消。
+ * @param[in,out] queue 借用且在调用期存活的队列。
+ * @param[in] run_id 非零运行 ID。
+ * @return 匹配项为 CC_OK，包括已经完成项，缺失为 CC_ERR_NOT_FOUND，非法参数为 CC_ERR_INVALID_ARGUMENT。
+ * @note 已完成结果保留，取消发布与运行回调退出分别判断。
+ */
 cc_result_t cc_run_queue_interrupt_run(
     cc_run_queue_t *queue,
     cc_run_id_t run_id
@@ -814,7 +992,11 @@ cc_result_t cc_run_queue_interrupt_run(
     return cc_result_ok();
 }
 
-/* 读取当前 in-flight 总数。 */
+/**
+ * @brief 在队列锁内读取当前运行作业总数。
+ * @param[in] queue 借用且存活的队列，允许 NULL。
+ * @return 锁内数值快照，NULL 返回零，不触发 TTL 清理。
+ */
 size_t cc_run_queue_in_flight(cc_run_queue_t *queue)
 {
     if (!queue) return 0;
@@ -824,7 +1006,11 @@ size_t cc_run_queue_in_flight(cc_run_queue_t *queue)
     return value;
 }
 
-/* 读取当前 pending 总数。 */
+/**
+ * @brief 在队列锁内读取当前等待作业总数。
+ * @param[in] queue 借用且存活的队列，允许 NULL。
+ * @return 锁内数值快照，NULL 返回零，不触发 TTL 清理。
+ */
 size_t cc_run_queue_pending(cc_run_queue_t *queue)
 {
     if (!queue) return 0;
@@ -834,6 +1020,13 @@ size_t cc_run_queue_pending(cc_run_queue_t *queue)
     return value;
 }
 
+/**
+ * @brief 放弃作业结果，立即删除可清理项或标记运行项结束后自清理。
+ * @param[in,out] queue 借用且在调用期存活的队列。
+ * @param[in] run_id 非零运行 ID。
+ * @return 已找到为 CC_OK，缺失为 CC_ERR_NOT_FOUND，非法参数为 CC_ERR_INVALID_ARGUMENT。
+ * @note 运行项仅标记放弃并发取消，业务上下文需继续有效到任务结束，每次成功调用增加放弃累计数。
+ */
 cc_result_t cc_run_queue_abandon(cc_run_queue_t *queue, cc_run_id_t run_id)
 {
     if (!queue || run_id == 0) {
@@ -862,6 +1055,14 @@ cc_result_t cc_run_queue_abandon(cc_run_queue_t *queue, cc_run_id_t run_id)
     return cc_result_ok();
 }
 
+/**
+ * @brief 永久关闭新接纳、取消等待及运行项，并按预算等待在途回调归零。
+ * @pre 外层保持队列存活，当前线程不能等待自身所在的 worker 回调退出。
+ * @param[in,out] queue 借用的队列，成功或超时后均保持关闭状态。
+ * @param[in] timeout_ms 等待毫秒预算，UINT_MAX 无限等待，零值只检查是否已排空。
+ * @return 在途归零为 CC_OK，未在预算内归零为 CC_ERR_TIMEOUT，NULL 为 CC_ERR_INVALID_ARGUMENT。
+ * @note 返回成功后仍保留作业结果与 worker 句柄，销毁阶段继续 join，外部 API 调用由拥有者协调排空。
+ */
 cc_result_t cc_run_queue_shutdown(cc_run_queue_t *queue, unsigned timeout_ms)
 {
     if (!queue) return cc_result_error(CC_ERR_INVALID_ARGUMENT, "Null run queue");
@@ -897,6 +1098,12 @@ cc_result_t cc_run_queue_shutdown(cc_run_queue_t *queue, unsigned timeout_ms)
     return cc_result_ok();
 }
 
+/**
+ * @brief 清理过期完成结果后复制一次队列状态快照。
+ * @param[in,out] queue 借用且存活的队列，允许 NULL，非空时可能执行 TTL 删除。
+ * @param[out] out_status 借用的输出结构，NULL 直接返回，其他情况先清零并设置 size。
+ * @post 非空队列的计数与关闭状态在同一次锁内复制，NULL 队列得到仅含 size 的空快照。
+ */
 void cc_run_queue_get_status(cc_run_queue_t *queue, cc_run_queue_status_t *out_status)
 {
     if (!out_status) return;

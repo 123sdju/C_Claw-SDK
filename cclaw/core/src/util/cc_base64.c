@@ -7,10 +7,10 @@
 static const char k_base64_chars[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/*
- * 将 Base64 字符转换为 6-bit 索引值。
- * 参数: ch - 待转换的 Base64 字符
- * 返回: 0-63 有效字符索引，-2 填充符 '='，-3 空白字符（空格/换行/回车/制表），-1 非法字符
+/**
+ * @brief 将标准或 URL 安全 Base64 字节分类为六位索引、填充或空白。
+ * @param[in] ch 单个输入字节，支持 +/ 与 -_ 两套末尾字符。
+ * @return 0..63 为数据，-2 为等号，-3 为四类允许空白，-1 为其他非法字节。
  */
 static int base64_index(char ch)
 {
@@ -24,16 +24,13 @@ static int base64_index(char ch)
     return -1;
 }
 
-/*
- * 将二进制数据编码为 Base64 字符串。
- *
- * 参数:
- *   data     - 待编码的原始数据
- *   data_len - 数据长度（字节）
- *   out_text - 输出参数，接收动态分配的 Base64 字符串（调用方通过 free() 释放）
- * 返回: CC_OK 成功，CC_ERR_INVALID_ARGUMENT 参数无效，CC_ERR_OUT_OF_MEMORY 分配失败。
- *
- * 编码结果自动添加 padding（=）。每 3 个输入字节产生 4 个输出字符。
+/**
+ * @brief 检查长度算术并将二进制编码为带等号填充的标准 Base64。
+ * @param[in] data 调用期间稳定借用的 data_len 字节，长度为零时允许 NULL。
+ * @param[in] data_len 输入字节数，输出每三字节生成四字符并另加 NUL。
+ * @param[out] out_text 必填独立输出槽，有效槽先置 NULL，成功字符串由调用者 free。
+ * @return 成功为 CC_OK，参数错误、长度溢出和分配失败分别返回拥有错误结果。
+ * @note 空输入也交付一个拥有空字符串，接口不带共享状态或内部锁。
  */
 cc_result_t cc_base64_encode(
     const unsigned char *data,
@@ -87,16 +84,14 @@ cc_result_t cc_base64_encode(
     return cc_result_ok();
 }
 
-/*
- * 将 Base64 字符串解码为二进制数据。
- *
- * 参数:
- *   text     - Base64 编码的输入字符串
- *   out_data - 输出参数，接收动态分配的解码数据（调用方通过 free() 释放）
- *   out_len  - 输出参数，接收解码后数据长度
- * 返回: CC_OK 成功，CC_ERR_INVALID_ARGUMENT 参数无效或格式错误，CC_ERR_OUT_OF_MEMORY。
- *
- * 输入中的空白字符会被自动跳过，支持标准 Base64 和 URL-safe 变体。
+/**
+ * @brief 校验字符、四字节分组和填充位置后解码 Base64 字节。
+ * @param[in] text 必填稳定借用的 NUL 结尾文本，支持两套字母表及空格、制表、回车和换行。
+ * @param[out] out_data 必填独立输出槽，两个输出槽有效后先置 NULL，成功缓冲由调用者 free。
+ * @param[out] out_len 必填独立长度槽，两个输出槽有效后先置零，成功返回实际二进制字节数。
+ * @return 成功为 CC_OK，字符、长度、填充或参数错误为 INVALID_ARGUMENT，分配失败为 OOM。
+ * @note 非空输入清理空白后必须为四的倍数，支持非零填充位的既有宽松解码。
+ * 空输入分配一字节但返回长度零，输出为二进制且不追加字符串终止符。
  */
 cc_result_t cc_base64_decode(
     const char *text,

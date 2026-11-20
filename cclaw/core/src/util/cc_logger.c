@@ -13,9 +13,8 @@
 #include <time.h>
 
 /*
- * logger 内部状态。
- *
- * name 由 logger 拥有，level 控制过滤阈值，mutex 保证多线程日志不会交错输出。
+ * logger 拥有独立名称及实例锁，锁只保护名称快照和过滤级别。
+ * 格式化在实例锁外执行，stderr 由进程期 sink 锁串行，用户 sink 的并发由其自身协调。
  */
 struct cc_logger {
     char *name;
@@ -27,24 +26,25 @@ static cc_mutex_t g_sink_mutex;
 static cc_logger_sink_fn g_sink;
 static void *g_sink_user_data;
 
-/*
- * 懒初始化 sink 互斥锁（线程安全）。
- *
- * 在首次调用时创建 g_sink_mutex，后续调用直接返回。
- * 用于保护 g_sink_fn 和 g_sink_user_data 的并发访问。
+/**
+ * @brief 通过线程端口一次性安装进程期 sink 锁，失败允许后续重试。
+ * @return 进程期锁借用，创建失败为 NULL，拥有结果的消息在本函数消费。
+ * @note 该锁保护 sink/user_data 成对快照及 stderr 输出，当前无进程期销毁入口。
  */
-static void ensure_sink_mutex(void)
+static cc_mutex_t ensure_sink_mutex(void)
 {
-    if (!g_sink_mutex) {
-        cc_mutex_create(&g_sink_mutex);
-    }
+    cc_result_t rc = cc_mutex_init_once(&g_sink_mutex);
+    int ready = rc.code == CC_OK;
+    cc_result_free(&rc);
+    return ready ? g_sink_mutex : NULL;
 }
 
-/*
- * 创建 logger。
- *
- * name 为空时使用默认 "c-claw"；mutex 创建失败会释放已分配资源。当前 logger 输出到
- * stderr，后续可通过 port 扩展到 syslog、RTOS console 或 ring buffer。
+/**
+ * @brief 依序创建拥有名称、过滤阈值和实例 mutex 的 logger。
+ * @param[in] name 可选名称借用，复制失败报 OOM，NULL 使用 c-claw。
+ * @param[in] level 初始过滤阈值，按枚举数值比较。
+ * @param[out] out_logger 必填独立槽，先置 NULL，成功由调用者拥有并最终 destroy。
+ * @return CC_OK 或参数、名称/对象分配、mutex 创建错误，失败清理本次部分资源。
  */
 cc_result_t cc_logger_create(const char *name, cc_log_level_t level, cc_logger_t **out_logger)
 {
@@ -54,6 +54,10 @@ cc_result_t cc_logger_create(const char *name, cc_log_level_t level, cc_logger_t
     if (!logger) return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to create logger");
 
     logger->name = name ? cc_copy_string(name) : cc_copy_string("c-claw");
+    if (!logger->name) {
+        free(logger);
+        return cc_result_error(CC_ERR_OUT_OF_MEMORY, "Failed to copy logger name");
+    }
     logger->level = level;
     cc_result_t rc = cc_mutex_create(&logger->mutex);
     if (rc.code != CC_OK) {
@@ -61,16 +65,17 @@ cc_result_t cc_logger_create(const char *name, cc_log_level_t level, cc_logger_t
         free(logger);
         return rc;
     }
+    cc_result_free(&rc);
     *out_logger = logger;
     return cc_result_ok();
 }
 
 
-/*
- * 销毁 logger。
- *
- * 先在锁内释放 name，随后销毁 mutex。调用方必须保证没有其他线程还在 cc_logger_log()
- * 中使用该 logger。
+/**
+ * @brief 消费实例名称、mutex 和 logger 存储。
+ * @pre owner 已关闭新入口并结束该实例的在途访问及锁等待，成功后禁止继续调用旧句柄。
+ * @param[in,out] logger 可选拥有实例，NULL 为空操作。
+ * @post 实例及名称借用失效，全局 sink 注册与其 user_data 仍由全局拥有者保管。
  */
 void cc_logger_destroy(cc_logger_t *logger)
 {
@@ -83,7 +88,11 @@ void cc_logger_destroy(cc_logger_t *logger)
 }
 
 
-/* 日志级别到固定字符串的映射，用于 stderr 前缀。 */
+/**
+ * @brief 将日志级别转换为固定展示字符串。
+ * @param[in] level 输入枚举值。
+ * @return 进程期只读字符串，未知值返回 UNKNOWN，调用者禁止释放。
+ */
 static const char *level_string(cc_log_level_t level)
 {
     switch (level) {
@@ -98,15 +107,19 @@ static const char *level_string(cc_log_level_t level)
 }
 
 
-/*
- * 输出一条日志。
- *
- * 函数在 mutex 内完成过滤、格式化、脱敏和写 stderr，保证单条日志原子输出。格式化后
- * 先经过 cc_redact_secrets()，这是防止 api_key/token/password 泄漏的最后一道防线。
+/**
+ * @brief 取得实例快照后格式化及脱敏正文，交给全局 sink 或 stderr。
+ * @param[in,out] logger 可选借用实例，NULL 为空操作，owner 保证入口和快照期间存活。
+ * @param[in] level 本条日志级别，小于实例阈值时直接返回。
+ * @param[in] fmt 可选 printf 格式串，NULL 不输出，正文借用覆盖两次格式化。
+ * @param[in] ... 符合格式类型的参数，引用内容在两次读取期间保持稳定。
+ * @post 临时名称、格式化正文、脱敏副本和完整行均在返回前释放，日志可能因 OOM 降级为静态诊断。
+ * @note 实例锁只保护阈值与名称复制，sink 在全部锁外同步调用，允许并发及重入。
+ * sink/user_data 成对读取后仍借用旧注册，外层保证其寿命覆盖已取得快照的调用。
  */
 void cc_logger_log(cc_logger_t *logger, cc_log_level_t level, const char *fmt, ...)
 {
-    if (!logger) return;
+    if (!logger || !fmt) return;
 
     cc_mutex_lock(logger->mutex);
 
@@ -120,9 +133,14 @@ void cc_logger_log(cc_logger_t *logger, cc_log_level_t level, const char *fmt, .
 
     time_t now = time(NULL);
     struct tm tm_info;
-    localtime_r(&now, &tm_info);
-    char time_buf[32];
-    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info);
+    char time_buf[32] = "unknown-time";
+#ifdef _WIN32
+    int time_ready = localtime_s(&tm_info, &now) == 0;
+#else
+    int time_ready = localtime_r(&now, &tm_info) != NULL;
+#endif
+    if (time_ready && strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm_info) == 0)
+        memcpy(time_buf, "unknown-time", sizeof("unknown-time"));
 
 
 
@@ -136,9 +154,11 @@ void cc_logger_log(cc_logger_t *logger, cc_log_level_t level, const char *fmt, .
     if (needed >= 0) {
         char *formatted = malloc((size_t)needed + 1);
         if (formatted) {
-            vsnprintf(formatted, (size_t)needed + 1, fmt, args);
-            char *redacted = cc_redact_secrets(formatted);
-            const char *message = redacted ? redacted : formatted;
+            int written = vsnprintf(formatted, (size_t)needed + 1, fmt, args);
+            char *redacted = NULL;
+            if (written >= 0 && written <= needed) redacted = cc_redact_secrets(formatted);
+            const char *message = redacted ? redacted : "[REDACTION_FAILED]";
+            if (written < 0 || written > needed) message = "[FORMAT_FAILED]";
             int line_needed = snprintf(NULL,
                                        0,
                                        "[%s] [%s] [%s] %s",
@@ -149,13 +169,17 @@ void cc_logger_log(cc_logger_t *logger, cc_log_level_t level, const char *fmt, .
             if (line_needed >= 0) {
                 line = malloc((size_t)line_needed + 1);
                 if (line) {
-                    snprintf(line,
-                             (size_t)line_needed + 1,
-                             "[%s] [%s] [%s] %s",
-                             time_buf,
-                             level_string(level),
-                             logger_name ? logger_name : "c-claw",
-                             message);
+                    int line_written = snprintf(line,
+                                                (size_t)line_needed + 1,
+                                                "[%s] [%s] [%s] %s",
+                                                time_buf,
+                                                level_string(level),
+                                                logger_name ? logger_name : "c-claw",
+                                                message);
+                    if (line_written < 0 || line_written > line_needed) {
+                        free(line);
+                        line = NULL;
+                    }
                 }
             }
             free(redacted);
@@ -172,17 +196,18 @@ void cc_logger_log(cc_logger_t *logger, cc_log_level_t level, const char *fmt, .
 
     cc_logger_sink_fn sink = NULL;
     void *sink_user_data = NULL;
-    ensure_sink_mutex();
-    if (g_sink_mutex) {
-        cc_mutex_lock(g_sink_mutex);
+    cc_mutex_t sink_mutex = ensure_sink_mutex();
+    if (sink_mutex) {
+        cc_mutex_lock(sink_mutex);
         sink = g_sink;
         sink_user_data = g_sink_user_data;
-        cc_mutex_unlock(g_sink_mutex);
+        cc_mutex_unlock(sink_mutex);
     }
 
     if (sink && line) {
         sink(sink_user_data, level, logger_name ? logger_name : "c-claw", line);
     } else {
+        if (sink_mutex) cc_mutex_lock(sink_mutex);
         if (line) {
             fputs(line, stderr);
         } else {
@@ -194,13 +219,19 @@ void cc_logger_log(cc_logger_t *logger, cc_log_level_t level, const char *fmt, .
         }
         fprintf(stderr, "\n");
         fflush(stderr);
+        if (sink_mutex) cc_mutex_unlock(sink_mutex);
     }
     free(line);
     free(logger_name);
 }
 
 
-/* 动态调整日志过滤级别；加锁保证其他线程看到一致的 level。 */
+/**
+ * @brief 在实例 mutex 内替换日志过滤阈值。
+ * @param[in,out] logger 可选稳定借用实例，NULL 为空操作。
+ * @param[in] level 新阈值，已通过旧阈值检查的日志继续完成本次输出。
+ * @post 后续取得实例锁的日志读取新值，未提供回溯取消或销毁屏障。
+ */
 void cc_logger_set_level(cc_logger_t *logger, cc_log_level_t level)
 {
     if (!logger) return;
@@ -209,25 +240,22 @@ void cc_logger_set_level(cc_logger_t *logger, cc_log_level_t level)
     cc_mutex_unlock(logger->mutex);
 }
 
-/*
- * 设置全局日志输出回调函数。
- *
- * 参数:
- *   sink      - 日志输出回调，接收格式化后的日志行
- *   user_data - 透传给回调的用户数据
- *
- * 线程安全：通过 g_sink_mutex 保护。设置后所有 cc_log 调用都将
- * 通过此回调输出。设为 NULL 可禁用日志输出。
+/**
+ * @brief 在进程期 mutex 内成对替换全局 sink 及用户上下文。
+ * @param[in] sink 可选同步回调，NULL 恢复 stderr 默认输出。
+ * @param[in,out] user_data 回调上下文借用，原拥有者保证其覆盖已取快照的全部调用。
+ * @post 成功取得 sink 锁后新调用读取新注册，锁创建失败保留原注册。
+ * @note void 接口不报告锁创建失败，也不等待旧回调退出，替换及最终清理由全局 owner 协调。
  */
 void cc_logger_set_sink(cc_logger_sink_fn sink, void *user_data)
 {
-    ensure_sink_mutex();
-    if (!g_sink_mutex) {
+    cc_mutex_t sink_mutex = ensure_sink_mutex();
+    if (!sink_mutex) {
         return;
     }
 
-    cc_mutex_lock(g_sink_mutex);
+    cc_mutex_lock(sink_mutex);
     g_sink = sink;
     g_sink_user_data = user_data;
-    cc_mutex_unlock(g_sink_mutex);
+    cc_mutex_unlock(sink_mutex);
 }

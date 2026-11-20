@@ -31,7 +31,7 @@
 #endif
 
 
-/* sandbox 依赖检查：本地沙箱需要进程执行能力。 */
+/* 沙箱依赖检查，本地沙箱需要进程执行能力。 */
 #if CC_SANDBOX_LOCAL && !CC_HAS_PROCESS_RUN
 #  error "CC_SANDBOX_LOCAL requires CC_HAS_PROCESS_RUN"
 #endif
@@ -40,8 +40,8 @@
 /*
  * 网络/HTTP 依赖检查。
  *
- * 云 provider 和 http.request 工具都依赖网络能力；非 ESP32/FreeRTOS 平台默认要求 curl
- * 或等价 HTTP client adapter，避免链接阶段才暴露缺失实现。
+ * 云 provider 和 http.request 工具都依赖网络能力。当前编译期规则还要求
+ * 非 ESP32/FreeRTOS 平台启用 CC_HAS_CURL，替换运行时 HTTP 端口仍须满足此 profile 条件。
  */
 #if (CC_LLM_OPENAI || CC_LLM_OLLAMA || CC_LLM_ANTHROPIC) && !CC_HAS_NETWORK
 #  error "LLM providers require CC_HAS_NETWORK"
@@ -57,7 +57,7 @@
 
 
 /* 存储依赖检查：至少启用一个后端，runtime/session/memory 才有可用落点。 */
-#if !CC_STORAGE_SQLITE && !CC_STORAGE_JSON_FILE && !CC_STORAGE_MEMORY
+#if !CC_STORAGE_SQLITE && !CC_STORAGE_JSON_FILE && !CC_STORAGE_JSON_SEGMENTED && !CC_STORAGE_MEMORY
 #  error "At least one storage backend must be enabled"
 #endif
 
